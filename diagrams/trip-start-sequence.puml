@@ -1,0 +1,94 @@
+@startuml trip-start-sequence
+title Запуск поездки — durable saga, исключительный lease и реальный ACK
+hide footbox
+skinparam shadowing false
+skinparam defaultFontName SansSerif
+skinparam defaultFontSize 13
+autonumber
+
+actor "Клиент" as client
+participant "Trip Service" as trip
+database "Trip DB" as db
+participant "User Service" as user
+participant "Pricing Service" as pricing
+participant "Geofence Service" as geo
+participant "Fleet Service" as fleet
+participant "Billing Service" as billing
+participant "PSP" as psp
+queue "MQTT" as mqtt
+participant "Самокат" as device
+
+client -> trip : POST /trips {scooterId}\nIdempotency-Key
+trip -> db : Создать PREPARING и шаги saga\nУникальность незавершённой поездки userId
+db --> trip : tripId, operationId
+trip --> client : 202 Accepted + tripId/operationId
+note over trip,db
+  Состояние saga и намерение следующего шага сохраняются.
+  После перезапуска worker продолжает с сохранённого шага.
+  Повтор запроса возвращает существующую операцию.
+end note
+trip -> user : Проверить rental-eligibility
+user --> trip : allowed + версия
+trip -> fleet : Получить состояние и доверенное измерение
+fleet --> trip : Готовность, координата, время, точность
+trip -> geo : Проверить старт по измерению
+geo --> trip : allowed + policyVersion/checkId
+trip -> pricing : Создать котировку
+pricing --> trip : Неизменяемый snapshot + expiresAt
+trip -> fleet : Захватить lease(scooterId, tripId)
+fleet --> trip : leaseId + fencingToken (атомарно)
+trip -> billing : Авторизовать сумму\noperationKey = tripId:authorize
+billing -> psp : Авторизация с idempotency key
+
+alt Явный отказ авторизации
+  psp --> billing : declined
+  billing --> trip : DECLINED
+  trip -> fleet : Освободить подготовительный lease\nТолько тот же tripId, команда не отправлялась
+  trip -> db : CANCELLED + причина
+else Результат авторизации неизвестен
+  psp --> billing : Timeout / потерянный ответ
+  billing --> trip : PENDING_RECONCILIATION
+  trip -> db : Ожидание сверки; UNLOCK не отправлять
+  billing -> psp : Сверить по merchant reference
+  note over trip,psp
+    Продолжить только после подтверждённой авторизации
+    и повторной проверки lease/котировки.
+    При отмене старта поздний hold снимается идемпотентно.
+  end note
+else Авторизация подтверждена
+  psp --> billing : authorized + authorizationId
+  billing --> trip : AUTHORIZED
+  trip -> db : Проверить срок котировки; сохранить\nSTARTING + snapshot + намерение UNLOCK
+  trip -> fleet : UNLOCK(commandId, tripId, lease, expiresAt)
+  note right of fleet
+    Lease, владелец и token проверяются атомарно.
+    DeviceCommand + outbox фиксируются локально.
+    После потенциальной отправки TTL lease
+    не делает самокат свободным автоматически.
+  end note
+  fleet --> trip : Команда принята, но ещё не исполнена
+  fleet -> mqtt : UNLOCK с ID, сроком и fencing token
+  mqtt -> device : Доставить UNLOCK
+
+  alt Получено подтверждение фактического открытия
+    device -> mqtt : CommandResult(commandId, OPEN, deviceTime)
+    mqtt -> fleet : Передать результат устройства
+    trip -> fleet : Получить результат (polling / событие Kafka)
+    fleet --> trip : OPEN_CONFIRMED + проверенное время
+    trip -> db : ACTIVE + startedAt + outbox
+  else Потеря ACK / неизвестный результат
+    trip -> db : RECONCILING; ресурс и пользователь заняты
+    trip -> fleet : Запросить сверку замка и команды
+    fleet -> mqtt : QUERY_STATE
+    mqtt -> device : Проверить фактическое состояние
+    note over trip,device
+      Подтверждённое исполнение -> ACTIVE.
+      Подтверждённое неисполнение -> отмена и снятие hold.
+      Пока результат неизвестен, новый lease запрещён.
+    end note
+  end
+end
+
+client -> trip : GET /trips/{tripId}
+trip --> client : Текущее состояние и причина ожидания/отказа
+@enduml

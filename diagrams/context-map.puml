@@ -1,0 +1,52 @@
+@startuml context-map
+!pragma layout smetana
+title Context Map — аренда электросамокатов, вариант 2224
+top to bottom direction
+skinparam shadowing false
+skinparam defaultFontName SansSerif
+skinparam defaultFontSize 13
+skinparam rectangle {
+  BackgroundColor #EFF6FF
+  BorderColor #2563EB
+  RoundCorner 12
+}
+skinparam ArrowColor #475569
+skinparam nodesep 90
+skinparam ranksep 90
+
+rectangle "User Management\nПользователи\n[User Service]" as users
+rectangle "Fleet & IoT\nПарк и устройства\n[Fleet + Telemetry Services]" as fleet
+rectangle "Rental\nАренда\n[Trip Service]" as rental #DBEAFE
+rectangle "Discovery\nПоиск\n[Discovery Service]" as search
+rectangle "Pricing\nТарификация\n[Pricing Service]" as pricing
+rectangle "Billing\nРасчёты и штрафы\n[Billing Service]" as billing
+rectangle "Geofencing\nГеополитики\n[Geofence Service]" as geo
+rectangle "Платёжный провайдер\nВнешний контекст" as psp #F1F5F9
+
+rental --> users : Проверяет право старта\nOHS/PL; User U, Rental D
+users ..> rental : UserAccessChanged\nPL; User U, Rental D
+rental --> fleet : Получает состояние, захватывает lease,\nзапрашивает LOCK/UNLOCK и результат\nCustomer-Supplier; Fleet U, Rental D
+fleet ..> rental : DeviceCommandUpdated\nPL; Fleet U, Rental D
+rental --> pricing : Получает котировку и snapshot\nOHS/PL; Pricing U, Rental D
+rental --> geo : Проверяет старт/парковку\nOHS/PL; Geo U, Rental D
+rental --> billing : Запрашивает/отменяет авторизацию\nCustomer-Supplier; Billing U, Rental D
+rental ..> billing : TripEnded + snapshot + свидетельства\nPL/адаптер; Rental U, Billing D
+billing ..> rental : PaymentStatusChanged / FineIssued\nPL; Billing U, Rental D
+billing ..> users : Передаёт финансовый статус\nPL; Billing U, User D
+billing --> pricing : Рассчитывает цену по snapshot\nOHS/PL; Pricing U, Billing D
+billing --> psp : Авторизация, списание, возврат, сверка\nACL в Billing; PSP U, Billing D
+psp ..> billing : Подписанные webhook статусов\nACL в Billing; PSP U, Billing D
+fleet ..> search : Доступность и LocationObserved\nPL + ACL; Fleet U, Discovery D
+fleet ..> geo : LocationObserved для геопроекции\nPL; Fleet U, Geo D
+pricing ..> search : TariffVersionPublished\nPL + ACL; Pricing U, Discovery D
+geo ..> search : GeofenceVersionPublished\nPL + ACL; Geo U, Discovery D
+
+legend bottom left
+  Прямоугольник = bounded context; число сервисов внутри может различаться.
+  Сплошная стрелка: инициатор запроса -> поставщик API.
+  Пунктирная стрелка: производитель факта -> потребитель.
+  U / D = upstream / downstream для подписанного контракта, не направление RPC.
+  OHS/PL = Open Host Service / Published Language; ACL = Anti-Corruption Layer.
+  Kafka, базы данных и Gateway не являются бизнес-контекстами.
+endlegend
+@enduml

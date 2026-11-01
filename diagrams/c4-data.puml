@@ -1,0 +1,44 @@
+@startuml c4-data
+!pragma layout smetana
+!include <C4/C4_Container>
+title C4 — C2: владение данными (связи сервисов — на виде c4-containers)
+LAYOUT_TOP_DOWN()
+
+System_Boundary(platform, "Платформа аренды — отдельная БД и учётная запись на сервис") {
+  Container(user, "User Service", "REST API", "User Management")
+  ContainerDb(userdb, "User DB", "PostgreSQL", "User, доступ, сессии, inbox/outbox")
+  Container(fleet, "Fleet Service", "REST API + MQTT workers", "Fleet & IoT: команды и ресурс")
+  ContainerDb(fleetdb, "Fleet DB", "PostgreSQL", "Scooter, ScooterLease, DeviceCommand, inbox/outbox")
+  Container(telemetry, "Telemetry Service", "MQTT ingestion", "Fleet & IoT: измерения")
+  ContainerDb(telemetrydb, "Telemetry DB", "TimescaleDB / PostgreSQL", "Location, heartbeat, качество, outbox; отдельная ретенция")
+  Container(discovery, "Discovery Service", "REST API + consumers", "Discovery")
+  ContainerDb(searchdb, "Discovery Index", "Redis GEO + checkpoints", "Производные документы; доступность и свежесть; восстановим из snapshot + событий")
+  Container(trip, "Trip Service", "REST API + saga workers", "Rental")
+  ContainerDb(tripdb, "Trip DB", "PostgreSQL", "Trip, шаги saga, snapshots, операции, inbox/outbox")
+  Container(pricing, "Pricing Service", "REST API", "Pricing")
+  ContainerDb(pricingdb, "Pricing DB", "PostgreSQL", "Tariff, версии, правила, Quote, outbox")
+  Container(billing, "Billing Service", "REST API + workers", "Billing")
+  ContainerDb(billingdb, "Billing DB", "PostgreSQL", "Payment, Fine, FinePolicy, LedgerEntry, inbox/outbox")
+  Container(geo, "Geofence Service", "REST API + geo workers", "Geofencing")
+  ContainerDb(geodb, "Geofence DB", "PostgreSQL / PostGIS", "Geofence, версии, GeoCheck, ViolationEvidence, inbox/outbox")
+}
+
+Rel_R(user, userdb, "Владеет; читает/пишет", "SQL")
+Rel_R(fleet, fleetdb, "Владеет; читает/пишет", "SQL")
+Rel_R(telemetry, telemetrydb, "Владеет; читает/пишет", "SQL")
+Rel_R(discovery, searchdb, "Обновляет/читает проекцию", "Redis")
+Rel_R(trip, tripdb, "Владеет; читает/пишет", "SQL")
+Rel_R(pricing, pricingdb, "Владеет; читает/пишет", "SQL")
+Rel_R(billing, billingdb, "Владеет; читает/пишет", "SQL")
+Rel_R(geo, geodb, "Владеет; читает/пишет", "SQL")
+
+Lay_D(user, fleet)
+Lay_D(fleet, telemetry)
+Lay_D(telemetry, discovery)
+Lay_D(discovery, trip)
+Lay_D(trip, pricing)
+Lay_D(pricing, billing)
+Lay_D(billing, geo)
+
+SHOW_LEGEND()
+@enduml
