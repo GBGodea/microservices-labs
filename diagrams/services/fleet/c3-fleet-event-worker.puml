@@ -1,0 +1,53 @@
+@startuml c3-fleet-event-worker
+!pragma layout smetana
+!include <C4/C4_Component>
+title C4 — C3: Fleet Event Worker (Fleet Service)
+LAYOUT_TOP_DOWN()
+
+ContainerQueue(kafka, "Доменные события", "Apache Kafka", "telemetry.location.v1 (96 партиций), photo.status.v1 (24), DLQ")
+
+Container_Boundary(event_worker, "Fleet Event Worker") {
+  Component(telemetry_consumer, "Telemetry Batch Consumer", "Spring Kafka, batch listener", "group fleet-event-worker (общая с photo.status.v1); max.poll.records 2000; commit offset после COMMIT в БД; ошибка БД -> пауза партиций и повтор, не DLQ")
+  Component(coalescer, "Partition Coalescer", "Kotlin, map на партицию", "Последнее измерение на scooterId за окно ~1 с; отбрасывает (measuredAt, seq) не новее уже виденного")
+  Component(decision, "Write Decision Policy", "Kotlin, доменная политика", "Писать, если lockState/порог заряда сменился, смещение >= 5 м или прошло >= 15 с")
+  Component(cache, "Last Persisted Cache", "Caffeine, на партицию", "Последнее записанное значение; прогрев PK-чтением при назначении партиций")
+  Component(writer, "Batch Upsert Writer", "Spring JDBC, unnest", "INSERT ... ON CONFLICT DO UPDATE WHERE (measured_at, seq) новее; пачки по 1000")
+  Component(availability, "Availability Transition Handler", "Kotlin", "LOW_BATTERY (гистерезис 15/20 %), возврат online")
+  Component(offline, "Offline Sweeper", "Spring @Scheduled + advisory lock", "Нет телеметрии 60 с -> OFFLINE; пауза при лаге consumer > 10 с")
+  Component(policy, "Availability Policy", "Kotlin, общий модуль", "Фаза lease + обслуживание + online + заряд -> availability")
+  Component(photo_consumer, "Photo Status Consumer", "Spring Kafka, record listener", "group fleet-event-worker; фильтр purpose = DAMAGE_REPORT; временная ошибка -> пауза и повтор на месте, постоянная -> DLQ")
+  Component(inbox, "Inbox Dedup", "Spring JDBC", "inbox_message (consumer_group, event_id)")
+  Component(photo_projector, "Damage Photo Projector", "Kotlin", "photo_status_projection; проверка owner/subject; статус фото в отчёте")
+  Component(outbox, "Outbox Writer", "Spring JDBC", "ScooterAvailabilityChanged в той же транзакции")
+}
+
+ContainerDb(fleet_db, "Fleet DB", "PostgreSQL", "scooter_last_measurement, scooter, damage_report_photo, inbox, outbox")
+Container(cdc, "Outbox CDC", "Kafka Connect + Debezium", "fleet.scooter-availability.v1")
+
+Rel(kafka, telemetry_consumer, "LocationObserved", "Kafka: telemetry.location.v1")
+Rel(kafka, photo_consumer, "PhotoValidated / PhotoRejected", "Kafka: photo.status.v1")
+Rel(telemetry_consumer, coalescer, "Пачка записей партиции", "in-process")
+Rel(coalescer, decision, "Кандидаты на запись", "вызов")
+Rel(decision, cache, "Сравнить с записанным", "вызов")
+Rel(decision, writer, "Изменённые измерения", "вызов")
+Rel(decision, availability, "Смена заряда / online", "вызов")
+Rel(writer, cache, "Обновить после COMMIT", "вызов")
+Rel(availability, policy, "Пересчёт availability", "вызов")
+Rel(offline, policy, "OFFLINE", "вызов")
+Rel(policy, outbox, "ScooterAvailabilityChanged", "вызов")
+Rel(photo_consumer, inbox, "Проверка eventId", "вызов")
+Rel(photo_consumer, photo_projector, "Новое событие", "вызов")
+Rel_U(photo_consumer, kafka, "Постоянная ошибка: схема, инвариант", "Kafka: photo.status.v1.dlq.fleet-event-worker")
+Rel_U(telemetry_consumer, kafka, "Неразбираемое / нарушение схемы", "Kafka: telemetry.location.v1.dlq.fleet-event-worker")
+
+Rel(writer, fleet_db, "Батч-UPSERT scooter_last_measurement ~1 раз/с", "SQL")
+Rel(cache, fleet_db, "Прогрев: SELECT по PK", "SQL")
+Rel(availability, fleet_db, "Условный UPDATE scooter", "SQL")
+Rel(offline, fleet_db, "Поиск молчащих, advisory lock", "SQL")
+Rel(inbox, fleet_db, "INSERT ... ON CONFLICT DO NOTHING", "SQL")
+Rel(photo_projector, fleet_db, "UPSERT проекции, UPDATE damage_report_photo", "SQL")
+Rel(outbox, fleet_db, "INSERT outbox_event", "SQL")
+Rel(cdc, fleet_db, "Читает WAL outbox_event", "logical replication")
+
+SHOW_LEGEND()
+@enduml

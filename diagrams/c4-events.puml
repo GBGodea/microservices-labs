@@ -1,0 +1,98 @@
+@startuml c4-events
+!pragma layout smetana
+!include <C4/C4_Container>
+title C4 — C2: событийные потоки (Kafka)
+LAYOUT_LEFT_RIGHT()
+
+AddRelTag("outbox", $legendText = "публикация через outbox: запись outbox_event в транзакции своей БД → WAL → Outbox CDC")
+AddRelTag("direct", $lineStyle = BoldLine(), $legendText = "публикация напрямую, без outbox (повтор безопасен по measurementId)")
+AddRelTag("sub", $lineStyle = DashedLine(), $legendText = "подписка; consumer group = имя контейнера, дедуп через inbox")
+AddRelTag("sub_ver", $lineStyle = DashedLine(), $lineColor = "#2E7D32", $textColor = "#2E7D32", $legendText = "подписка без inbox; consumer group = имя контейнера, идемпотентность по версии: aggregateVersion (Discovery), (measured_at, seq) (Fleet)")
+AddRelTag("assign", $lineStyle = DottedLine(), $legendText = "служебное чтение без consumer group: assign() партиций, offset не фиксируется")
+
+System_Boundary(platform, "Платформа аренды самокатов") {
+  ' --- Только производители
+  Container(user_api, "User API", "User Service", "Блокировки, удаление аккаунта")
+  Container(fleet_api, "Fleet API", "Fleet Service", "Обслуживание, lease")
+  Container(fleet_cmd_worker, "Fleet Command Worker", "Fleet Service", "Результаты команд, сверка")
+  Container(pricing_api, "Pricing API", "Pricing Service", "Публикация версий тарифа")
+  Container(billing_api, "Billing API", "Billing Service", "Авторизации, погашение долга, ручные штрафы, обжалования")
+  Container(billing_recon, "Billing Reconciliation Worker", "Billing Service", "Исходы webhook и сверки")
+  Container(telemetry_ingestor, "Telemetry Ingestor", "Telemetry Service", "Подписанные измерения")
+
+  Container(cdc, "Outbox CDC", "Kafka Connect + Debezium Outbox Event Router", "Читает WAL сервисных БД (logical replication), публикует outbox_event в топик из поля topic")
+
+  Boundary(kafka, "Доменные события — Apache Kafka + Schema Registry (RF=3, min.insync=2, acks=all)", $type="брокер событий") {
+    ContainerQueue(t_user, "user.access.v1", "key userId; 24 / 7 д", "UserAccessChanged")
+    ContainerQueue(t_avail, "fleet.scooter-availability.v1", "key scooterId; 48 / compact", "ScooterAvailabilityChanged")
+    ContainerQueue(t_cmd, "fleet.device-command.v1", "key scooterId; 48 / 7 д", "DeviceCommandUpdated (только команды поездки, без ACCEPTED)")
+    ContainerQueue(t_loc, "telemetry.location.v1", "key scooterId; 96 / 24 ч", "LocationObserved (подписанное)")
+    ContainerQueue(t_tariff, "pricing.tariff-version.v1", "key tariffId; 6 / compact", "TariffVersionPublished")
+    ContainerQueue(t_geo, "geofence.version.v1", "key cityId; 6 / compact; до 4 МБ, zstd", "GeofenceVersionPublished")
+    ContainerQueue(t_trip, "trip.lifecycle.v1", "key tripId; 24 / 14 д", "TripEnded")
+    ContainerQueue(t_pay, "billing.payment-status.v1", "key userId; 24 / 14 д", "PaymentStatusChanged")
+    ContainerQueue(t_fine, "billing.fine.v1", "key userId; 12 / 30 д", "FineIssued, FineStatusChanged")
+    ContainerQueue(t_photo, "photo.status.v1", "key photoId; 24 / 7 д", "PhotoValidated, PhotoRejected")
+  }
+
+  ' --- Потребители (часть из них тоже публикует)
+  Container(user_worker, "User Worker", "User Service", "Долги/штрафы → статус доступа")
+  Container(trip_worker, "Trip Saga Worker", "Trip Service", "Saga, статус фото, TripEnded")
+  Container(billing_settlement, "Billing Settlement Worker", "Billing Service", "TripEnded → списание; штрафы")
+  Container(photo_worker, "Photo Processing Worker", "Photo Service", "Статус фото, удержания, удаление")
+  Container(fleet_event_worker, "Fleet Event Worker", "Fleet Service", "Проекция телеметрии, фото повреждений")
+  Container(discovery_projector, "Discovery Projector", "Discovery Service", "Геоиндекс из событий")
+  Container(geo_api, "Geofence API", "Geofence Service", "Версии зон; кеш реплик")
+}
+
+' --- Производители -> Outbox CDC (outbox_event в своей БД, CDC читает WAL)
+Rel(user_api, cdc, "UserAccessChanged", "outbox (WAL)", $tags="outbox")
+Rel(fleet_api, cdc, "ScooterAvailabilityChanged", "outbox (WAL)", $tags="outbox")
+Rel(fleet_cmd_worker, cdc, "DeviceCommandUpdated, ScooterAvailabilityChanged", "outbox (WAL)", $tags="outbox")
+Rel(pricing_api, cdc, "TariffVersionPublished", "outbox (WAL)", $tags="outbox")
+Rel(billing_api, cdc, "PaymentStatusChanged, FineIssued (MANUAL), FineStatusChanged", "outbox (WAL)", $tags="outbox")
+Rel(billing_recon, cdc, "PaymentStatusChanged, FineStatusChanged (PAID)", "outbox (WAL)", $tags="outbox")
+Rel_U(user_worker, cdc, "UserAccessChanged", "outbox (WAL)", $tags="outbox")
+Rel_U(trip_worker, cdc, "TripEnded", "outbox (WAL)", $tags="outbox")
+Rel_U(billing_settlement, cdc, "PaymentStatusChanged, FineIssued (AUTO), FineStatusChanged", "outbox (WAL)", $tags="outbox")
+Rel_U(photo_worker, cdc, "PhotoValidated, PhotoRejected", "outbox (WAL)", $tags="outbox")
+Rel_U(fleet_event_worker, cdc, "ScooterAvailabilityChanged", "outbox (WAL)", $tags="outbox")
+Rel_U(geo_api, cdc, "GeofenceVersionPublished", "outbox (WAL)", $tags="outbox")
+
+' --- Outbox CDC -> топики
+Rel(cdc, t_user, "", "Kafka")
+Rel(cdc, t_avail, "", "Kafka")
+Rel(cdc, t_cmd, "", "Kafka")
+Rel(cdc, t_tariff, "", "Kafka")
+Rel(cdc, t_geo, "", "Kafka")
+Rel(cdc, t_trip, "", "Kafka")
+Rel(cdc, t_pay, "", "Kafka")
+Rel(cdc, t_fine, "", "Kafka")
+Rel(cdc, t_photo, "", "Kafka")
+
+' --- Прямая публикация телеметрии
+Rel(telemetry_ingestor, t_loc, "LocationObserved", "Kafka, после коммита батча", $tags="direct")
+
+' --- Топики -> потребители
+Rel(t_user, trip_worker, "UserAccessChanged", "Kafka", $tags="sub")
+Rel(t_user, photo_worker, "UserAccessChanged (DELETED)", "Kafka", $tags="sub")
+Rel(t_user, billing_settlement, "UserAccessChanged (DELETED) → удаление токенов PSP", "Kafka", $tags="sub")
+Rel(t_avail, discovery_projector, "ScooterAvailabilityChanged", "Kafka", $tags="sub_ver")
+Rel(t_cmd, trip_worker, "DeviceCommandUpdated", "Kafka", $tags="sub")
+Rel(t_loc, discovery_projector, "LocationObserved", "Kafka", $tags="sub_ver")
+Rel(t_loc, fleet_event_worker, "LocationObserved", "Kafka", $tags="sub_ver")
+Rel(t_tariff, discovery_projector, "TariffVersionPublished", "Kafka", $tags="sub_ver")
+Rel(t_geo, discovery_projector, "GeofenceVersionPublished", "Kafka", $tags="sub_ver")
+Rel(t_geo, geo_api, "GeofenceVersionPublished (кеш реплик)", "Kafka, assign()", $tags="assign")
+Rel(t_loc, telemetry_ingestor, "LocationObserved: дозапись после отказа БД (KafkaBackfillLoader)", "Kafka, assign()", $tags="assign")
+Rel(t_trip, billing_settlement, "TripEnded", "Kafka", $tags="sub")
+Rel(t_pay, trip_worker, "PaymentStatusChanged", "Kafka", $tags="sub")
+Rel(t_pay, user_worker, "PaymentStatusChanged", "Kafka", $tags="sub")
+Rel(t_fine, trip_worker, "FineIssued, FineStatusChanged", "Kafka", $tags="sub")
+Rel(t_fine, user_worker, "FineIssued, FineStatusChanged", "Kafka", $tags="sub")
+Rel(t_fine, photo_worker, "FineIssued, FineStatusChanged (удержания)", "Kafka", $tags="sub")
+Rel(t_photo, trip_worker, "PhotoValidated, PhotoRejected", "Kafka", $tags="sub")
+Rel(t_photo, fleet_event_worker, "PhotoValidated, PhotoRejected", "Kafka", $tags="sub")
+
+SHOW_LEGEND()
+@enduml

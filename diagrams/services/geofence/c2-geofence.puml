@@ -1,0 +1,38 @@
+@startuml c2-geofence
+!pragma layout smetana
+!include <C4/C4_Container>
+title C4 — C2: Geofence Service — контейнеры
+LAYOUT_TOP_DOWN()
+
+Person(operator, "Оператор", "GEO_MANAGER: черновики, валидация и публикация версий зон")
+
+System_Boundary(platform, "Платформа аренды самокатов") {
+  Container(gateway, "API Gateway", "HTTPS reverse proxy", "JWT оператора, роли, квоты; /admin/v1/geofence*")
+  Container(trip_worker, "Trip Saga Worker", "Kotlin, Spring Boot", "Шаги проверки старта и парковки в durable saga")
+  Container(billing_api, "Billing API", "Kotlin, Spring Boot", "Обжалования штрафов: читает свидетельство нарушения")
+  Container(discovery_projector, "Discovery Projector", "Kotlin, Spring Kafka", "Слой зон в геоиндексе карты")
+
+  Boundary(geofence_svc, "Geofence Service", $type="service") {
+    Container(geo_api, "Geofence API", "Kotlin, Spring Boot, JTS", "Проверки старта/парковки, версии зон, свидетельства; в памяти каждой реплики STRtree по городам (previous/current/scheduled)")
+    ContainerDb(geo_db, "Geofence DB", "PostgreSQL + PostGIS", "Версии и зоны (GiST), geo_check и violation_evidence (помесячные партиции), outbox")
+  }
+
+  Container(telemetry_api, "Telemetry API", "Kotlin, Spring Boot", "JWKS: публичные ключи Ed25519 подписи измерений")
+  Container(cdc, "Outbox CDC", "Kafka Connect + Debezium", "Читает outbox из WAL и публикует в Kafka")
+  ContainerQueue(kafka, "Доменные события", "Apache Kafka + Schema Registry", "geofence.version.v1 (6 партиций, compact)")
+}
+
+Rel(operator, gateway, "Управляет версиями зон", "HTTPS/JSON")
+Rel(gateway, geo_api, "/admin/v1/geofences, /admin/v1/geofence-versions", "HTTPS/JSON, JWT оператора")
+Rel(trip_worker, geo_api, "POST /internal/v1/geo-checks/start, /finish; GET /geo-checks/{id}", "HTTPS/JSON, mTLS")
+Rel(billing_api, geo_api, "GET /internal/v1/violation-evidence/{id} (обжалование)", "HTTPS/JSON, mTLS")
+Rel(discovery_projector, geo_api, "GET /internal/v1/geofence-versions/current, /{versionId} (версия и геометрия)", "HTTPS/JSON, mTLS")
+Rel(geo_api, geo_db, "geo_check + свидетельство; черновики, валидация, публикация + outbox", "SQL")
+Rel(geo_api, telemetry_api, "GET /internal/v1/signing-keys (кеш по kid)", "HTTPS/JSON, mTLS")
+Rel(cdc, geo_db, "Читает outbox_event", "Logical replication (WAL)")
+Rel(cdc, kafka, "GeofenceVersionPublished", "Kafka: geofence.version.v1")
+Rel(kafka, geo_api, "Обновление кеша КАЖДОЙ реплики (assign без группы)", "Kafka: geofence.version.v1")
+Rel(kafka, discovery_projector, "Новая версия зон", "Kafka: geofence.version.v1")
+
+SHOW_LEGEND()
+@enduml

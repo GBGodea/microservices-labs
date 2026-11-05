@@ -1,0 +1,61 @@
+@startuml c3-fleet-command-worker
+!pragma layout smetana
+!include <C4/C4_Component>
+title C4 — C3: Fleet Command Worker (Fleet Service)
+LAYOUT_TOP_DOWN()
+
+Container(fleet_api, "Fleet API", "Kotlin, Spring Boot", "Кладёт команды в device_command_queue, pg_notify")
+ContainerQueue(mqtt, "Канал устройств", "EMQX-кластер, mTLS", "devices/{scooterId}/commands, command-results, state")
+System_Ext(scooter, "Бортовая система самоката", "Отвергает fencingToken < сохранённого и просроченные команды")
+
+Container_Boundary(cmd_worker, "Fleet Command Worker") {
+  Component(wakeup, "Queue Wakeup Listener", "PG LISTEN (прямое соединение, мимо PgBouncer)", "Будит диспетчер; резервный опрос каждые 200 мс")
+  Component(dispatcher, "Command Dispatcher", "Kotlin, coroutines", "Захват due-строк FOR UPDATE SKIP LOCKED LIMIT 200, видимость 10 с")
+  Component(publisher, "MQTT Command Publisher", "HiveMQ MQTT 5 client", "QoS1, Message Expiry = expiresAt, ждёт PUBACK")
+  Component(result_sub, "Command Result Subscriber", "MQTT 5, ручной ack", "$share/fleet-command-worker/devices/+/command-results")
+  Component(state_sub, "Device State Subscriber", "MQTT 5, ручной ack", "$share/.../devices/+/state: ответы QUERY_STATE, BIRTH/LWT")
+  Component(state_machine, "Command State Machine", "Kotlin, доменная модель", "Монотонные переходы ACCEPTED..EXECUTED/FAILED/EXPIRED/UNKNOWN; событие только для команд с leaseId, начиная с SENT")
+  Component(timeouts, "Timeout & Retry Policy", "Kotlin", "Повтор публикации, дедлайн expiresAt+5 с -> EXPIRED или UNKNOWN")
+  Component(recon, "Reconciliation Service", "Kotlin", "QUERY_STATE, разбор recentCommands, QUARANTINED / RECONCILING")
+  Component(sweeper, "Lease Expiry Sweeper", "Spring @Scheduled", "PREPARING lease с expires_at < now(): RELEASED (EXPIRED)")
+  Component(leader, "Scheduler Lock", "pg_try_advisory_lock", "Один активный экземпляр sweeper")
+  Component(policy, "Availability Policy", "Kotlin, общий модуль", "Пересчёт availability после смены фазы lease")
+  Component(repos, "Repositories", "Spring JDBC", "device_command, device_command_queue, scooter_active_lease, scooter, device_channel_status")
+  Component(outbox, "Outbox Writer", "Spring JDBC", "DeviceCommandUpdated, ScooterAvailabilityChanged")
+}
+
+ContainerDb(fleet_db, "Fleet DB", "PostgreSQL", "Очередь, команды, lease, outbox")
+Container(cdc, "Outbox CDC", "Kafka Connect + Debezium", "fleet.device-command.v1, fleet.scooter-availability.v1")
+
+Rel(fleet_api, fleet_db, "INSERT команды + NOTIFY", "SQL")
+Rel(wakeup, fleet_db, "LISTEN fleet_command_ready", "SQL")
+Rel(wakeup, dispatcher, "Сигнал", "in-process")
+Rel(dispatcher, repos, "Захват due-строк", "вызов")
+Rel(dispatcher, timeouts, "AWAIT_RESULT с истёкшим сроком", "вызов")
+Rel(dispatcher, publisher, "PENDING_SEND", "вызов")
+Rel_U(publisher, mqtt, "PUBLISH devices/{id}/commands", "MQTT 5 QoS1")
+Rel(publisher, state_machine, "PUBACK -> SENT", "вызов")
+Rel(mqtt, scooter, "Доставляет команду", "MQTT/TLS")
+Rel_U(scooter, mqtt, "Результат, state, LWT", "MQTT/TLS")
+Rel(mqtt, result_sub, "command-results", "MQTT 5 QoS1")
+Rel(mqtt, state_sub, "state", "MQTT 5 QoS1")
+Rel(result_sub, state_machine, "RECEIVED/EXECUTED/FAILED/...", "вызов")
+Rel(state_sub, recon, "Ответ QUERY_STATE", "вызов")
+Rel(state_sub, policy, "BIRTH/LWT: online", "вызов")
+Rel(timeouts, state_machine, "EXPIRED / UNKNOWN", "вызов")
+Rel(timeouts, recon, "UNKNOWN: начать сверку", "вызов")
+Rel(recon, state_machine, "UNKNOWN -> EXECUTED/FAILED", "вызов")
+Rel(recon, repos, "QUERY_STATE в очередь; фаза lease", "вызов")
+Rel(sweeper, leader, "Захват блокировки", "вызов")
+Rel(sweeper, repos, "DELETE ... SKIP LOCKED", "вызов")
+Rel(sweeper, policy, "RESERVED -> AVAILABLE", "вызов")
+Rel(state_machine, repos, "Условный UPDATE статуса", "вызов")
+Rel(state_machine, outbox, "DeviceCommandUpdated (leaseId != null, без ACCEPTED)", "вызов")
+Rel(policy, outbox, "ScooterAvailabilityChanged", "вызов")
+Rel(repos, fleet_db, "Чтение/запись", "SQL")
+Rel(leader, fleet_db, "advisory lock", "SQL")
+Rel(outbox, fleet_db, "INSERT outbox_event", "SQL")
+Rel(cdc, fleet_db, "Читает WAL outbox_event", "logical replication")
+
+SHOW_LEGEND()
+@enduml

@@ -1,0 +1,66 @@
+@startuml c3-photo-processing-worker
+!pragma layout smetana
+!include <C4/C4_Component>
+title C4 — C3: Photo Processing Worker (Photo Service)
+LAYOUT_TOP_DOWN()
+
+ContainerQueue(kafka, "Доменные события", "Apache Kafka + Schema Registry", "user.access.v1, billing.fine.v1 (вход); photo.status.v1 (выход через CDC)")
+Container(outbox_cdc, "Outbox CDC", "Kafka Connect + Debezium", "outbox_event из WAL → photo.status.v1")
+Container(monitoring, "Мониторинг", "Prometheus + Alertmanager", "Метрики, алерты")
+
+Container_Boundary(worker, "Photo Processing Worker") {
+  Component(dispatcher, "Job Dispatcher", "Spring Scheduling", "Захват заданий FOR UPDATE SKIP LOCKED, lease 2 мин, backoff, попытка считается при захвате")
+  Component(consumers, "Event Consumers", "Spring Kafka, group photo-processing-worker", "UserAccessChanged, FineIssued, FineStatusChanged; inbox в той же транзакции; DLQ")
+  Component(pipeline, "Validation Pipeline", "Kotlin", "Оркестрация шагов PROCESS; итог VALIDATED / REJECTED + флаги")
+  Component(decoder, "Integrity Checker & Decoder", "Kotlin + libvips/libheif (FFM)", "Размер и SHA-256, сигнатура JPEG/HEIC/WebP против contentType; декодирование ≤ 40 Мпикс, ≥ 640×480, EXIF-время")
+  Component(preview, "Preview Generator", "libvips", "WebP 640 px и 256 px, sRGB, без EXIF/GPS; оригинал не меняется")
+  Component(dedup, "Duplicate Detector", "Kotlin", "SHA-256 → DUPLICATE; pHash 64 бит, Хэмминг ≤ 8 с 50 последними фото → SUSPECTED_REUSE")
+  Component(quality, "Quality Analyzer", "libvips", "Дисперсия лапласиана, яркость → LOW_QUALITY")
+  Component(detector, "Scooter Detector", "ONNX Runtime (CPU), опционально", "Самокат в кадре < 0,35 → NO_SCOOTER_DETECTED; feature flag")
+  Component(status_writer, "Status & Outbox Writer", "Spring JDBC, @Transactional", "photo + photo_phash + outbox_event + удаление задания — одна транзакция")
+  Component(retention, "Retention & Hold Manager", "Kotlin + Spring Scheduling", "Удержания и legal hold; удаление по retention_until, по DELETED аккаунту, по запросу")
+  Component(reconciler, "Storage Reconciler", "Kotlin + Spring Scheduling", "HEAD для PENDING_UPLOAD → UPLOADED / EXPIRED; ежедневно S3 Inventory ↔ БД")
+  Component(s3_client, "Object Storage Client", "AWS SDK v2 + Resilience4j", "GET по versionId, PUT, DELETE версий, legal hold; тайм-ауты, retry, CB, bulkhead")
+  Component(repo, "Photo Repositories", "Spring JDBC", "photo, photo_processing_job, photo_retention_hold, photo_phash, fine_ref, inbox_message")
+  Component(metrics, "Metrics", "Micrometer", "Глубина и возраст очереди, длительность, отказы и флаги, сироты")
+}
+
+ContainerDb(photo_db, "Photo DB", "PostgreSQL", "Очередь, метаданные, удержания, outbox/inbox")
+ContainerDb(photo_s3, "Photo Object Storage", "S3-совместимое, регион РФ", "originals (SSE-KMS, Object Lock), derivatives, отчёты Inventory")
+
+Rel(kafka, consumers, "Доступ пользователя, штрафы", "Kafka: user.access.v1, billing.fine.v1")
+Rel(consumers, retention, "Удержания по photoIds; удаление по DELETED")
+Rel(consumers, repo, "inbox_message, fine_ref")
+
+Rel(dispatcher, repo, "Захват и lease заданий")
+Rel(dispatcher, pipeline, "PROCESS")
+Rel(dispatcher, reconciler, "CHECK_UPLOAD")
+Rel(dispatcher, retention, "DELETE_OBJECTS, SYNC_LEGAL_HOLD")
+
+Rel(pipeline, s3_client, "Оригинал по versionId (≤ 10 МБ)")
+Rel(pipeline, decoder, "1. Целостность, формат, декодирование")
+Rel(pipeline, preview, "2. Превью")
+Rel(pipeline, dedup, "3. Дубликаты")
+Rel(pipeline, quality, "4. Качество")
+Rel(pipeline, detector, "5. Детектор (опц.)")
+Rel(pipeline, status_writer, "6. Итог и флаги")
+Rel(preview, s3_client, "PUT превью (детерминированный ключ)")
+Rel(dedup, repo, "photo_phash по владельцу")
+Rel(status_writer, repo, "Условный UPDATE по version")
+
+Rel(retention, s3_client, "DELETE всех версий, legal hold ON/OFF")
+Rel(retention, repo, "retention_until, удержания, задания")
+Rel(reconciler, s3_client, "HEAD, чтение Inventory")
+Rel(reconciler, repo, "PENDING_UPLOAD, сверка ключей")
+
+Rel(s3_client, photo_s3, "GetObject, PutObject, DeleteObject, PutObjectLegalHold", "S3 API, HTTPS")
+Rel(repo, photo_db, "Транзакции", "SQL, PgBouncer")
+Rel(outbox_cdc, photo_db, "Читает outbox_event из WAL", "logical replication")
+Rel(outbox_cdc, kafka, "PhotoValidated, PhotoRejected", "Kafka: photo.status.v1")
+
+Rel(dispatcher, metrics, "Очередь, попытки")
+Rel(pipeline, metrics, "Длительность, отказы, флаги")
+Rel(monitoring, metrics, "Сбор /actuator/prometheus", "HTTP")
+
+SHOW_LEGEND()
+@enduml
