@@ -1,0 +1,44 @@
+@startuml c2-telemetry
+!pragma layout smetana
+!include <C4/C4_Container>
+title C4 — C2: Telemetry Service — контейнеры
+LAYOUT_TOP_DOWN()
+
+Person(operator, "Оператор", "Разбор споров и инцидентов")
+System_Ext(scooter, "Бортовая система самоката", "GPS, заряд, замок; сертификат устройства CN = scooterId")
+
+System_Boundary(platform, "Платформа аренды самокатов") {
+  ContainerQueue(mqtt, "Канал устройств", "MQTT Broker, EMQX-кластер, mTLS", "devices/{scooterId}/telemetry")
+  Container(gateway, "API Gateway", "HTTPS reverse proxy", "JWT оператора, квоты; /internal/v1 не публикует")
+  Container(vault, "Хранилище секретов", "HashiCorp Vault Transit (платформа DevOps)", "Версии ключа Ed25519 подписи измерений")
+
+  Boundary(telemetry_svc, "Telemetry Service", $type="service") {
+    Container(telemetry_ingestor, "Telemetry Ingestor", "Kotlin, MQTT client", "Приём MQTT, валидация, дедуп, пакетная запись, подпись Ed25519, публикация LocationObserved")
+    ContainerDb(telemetry_db, "Telemetry DB", "PostgreSQL + TimescaleDB", "Гипертаблица измерений, последнее положение, минутные агрегаты, ключи, аудит")
+    Container(telemetry_api, "Telemetry API", "Kotlin, Spring Boot", "Последнее измерение, snapshot, JWKS, история по ролям с аудитом")
+  }
+
+  ContainerQueue(kafka, "Доменные события", "Apache Kafka + Schema Registry", "telemetry.location.v1: 96 партиций, ключ scooterId, 24 ч")
+  Container(fleet_event_worker, "Fleet Event Worker", "Kotlin, Spring Kafka", "Последнее подписанное измерение во Fleet")
+  Container(discovery_projector, "Discovery Projector", "Kotlin, Spring Kafka", "Геоиндекс поиска")
+  Container(fleet_api, "Fleet API", "Kotlin, Spring Boot", "Состояние самоката и lease")
+  Container(geo_api, "Geofence API", "Kotlin, Spring Boot, JTS", "Проверка подписи и свежести измерения")
+}
+
+Rel(scooter, mqtt, "Измерение каждые 5 с", "MQTT QoS1, mTLS")
+Rel(mqtt, telemetry_ingestor, "Доставляет измерения", "MQTT QoS1, $share/telemetry-ingestor")
+Rel(telemetry_ingestor, vault, "Ключи подписи по версиям", "HTTPS, mTLS")
+Rel(telemetry_ingestor, telemetry_db, "Пакетная вставка", "SQL")
+Rel(telemetry_ingestor, kafka, "LocationObserved после коммита", "Kafka: telemetry.location.v1")
+Rel(telemetry_api, telemetry_db, "Чтение; запись аудита", "SQL")
+Rel(kafka, fleet_event_worker, "LocationObserved", "Kafka")
+Rel(kafka, discovery_projector, "LocationObserved", "Kafka")
+Rel(operator, gateway, "История перемещений", "HTTPS/JSON")
+Rel(gateway, telemetry_api, "История: /admin/v1/telemetry/...", "HTTPS/JSON")
+Rel(fleet_api, telemetry_api, "Последнее измерение (резерв)", "HTTPS/JSON, mTLS")
+Rel(discovery_projector, telemetry_api, "Snapshot положений", "HTTPS/JSON, mTLS")
+Rel(geo_api, telemetry_api, "JWKS ключей подписи", "HTTPS/JSON, mTLS")
+Rel(telemetry_api, fleet_api, "cityId самоката", "HTTPS/JSON, mTLS")
+
+SHOW_LEGEND()
+@enduml

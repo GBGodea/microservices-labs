@@ -1,0 +1,62 @@
+@startuml c2-billing
+!pragma layout smetana
+!include <C4/C4_Container>
+title C4 — C2: Billing Service — контейнеры
+LAYOUT_TOP_DOWN()
+
+Person(rider, "Пользователь", "Привязывает карту, видит платежи и долг, обжалует штраф")
+Person(operator, "Оператор", "FINANCE / SUPPORT: возвраты, решения по обжалованиям, политики штрафов")
+System_Ext(psp, "Платёжный провайдер (PSP)", "Страница/SDK ввода карты, токены, hold / capture / refund, webhook, реестры")
+
+System_Boundary(platform, "Платформа аренды самокатов") {
+  Container(gateway, "API Gateway", "HTTPS reverse proxy", "JWT, квоты; /api/v1/payment-methods, payments, fines, debts; /webhooks/v1/psp/**")
+  Container(trip_worker, "Trip Saga Worker", "Kotlin, Spring Boot", "Шаг saga старта: авторизация и отмена hold")
+  Container(pricing_api, "Pricing API", "Kotlin, Spring Boot", "Детерминированный расчёт цены по snapshot; JWKS ключей подписи котировок")
+  Container(photo_api, "Photo API", "Kotlin, Spring Boot", "Метаданные фото к обжалованию")
+  Container(trip_api, "Trip API", "Kotlin, Spring Boot", "Статус поездки для сверки осиротевших hold")
+  Container(geofence_api, "Geofence API", "Kotlin, Spring Boot", "Свидетельство нарушения для разбора обжалований и ручных штрафов")
+
+  Boundary(billing_svc, "Billing Service", $type="service") {
+    Container(billing_api, "Billing API", "Kotlin, Spring Boot", "Способы оплаты, синхронная авторизация (hold), платежи, штрафы, обжалования, погашение долга, приём webhook")
+    Container(billing_settlement, "Billing Settlement Worker", "Kotlin, Spring Kafka", "TripEnded → расчёт → capture / доп. списание; долги и повторы; возвраты; автоштрафы; UserAccessChanged(DELETED) → деактивация токенов")
+    Container(billing_recon, "Billing Reconciliation Worker", "Kotlin, Spring Boot", "Webhook-inbox, сверка неизвестных исходов, снятие поздних и осиротевших hold (по статусу поездки), удаление токенов у PSP, сверка реестров, архив")
+    ContainerDb(billing_db, "Billing DB", "PostgreSQL 17", "Авторизации, операции PSP, платежи, штрафы, журнал проводок (double-entry), outbox/inbox; sync-реплика + read replica")
+  }
+
+  ContainerDb(billing_archive, "Billing Archive (бакет Archive Store)", "S3-совместимое (платформа), versioning + Object Lock (compliance)", "Parquet-архив проводок и операций ≥ 5 лет после отчётного года, сырые webhook и реестры")
+
+  Container(cdc, "Outbox CDC", "Kafka Connect + Debezium", "Читает outbox из WAL, публикует в Kafka")
+  ContainerQueue(kafka, "Доменные события", "Apache Kafka + Schema Registry", "trip.lifecycle.v1, user.access.v1, billing.payment-status.v1, billing.fine.v1")
+  Container(user_worker, "User Worker", "Kotlin, Spring Kafka", "Финансовые ограничения → статус доступа; публикует UserAccessChanged")
+  Container(photo_worker, "Photo Processing Worker", "Kotlin, Spring Boot", "Удержание фото-доказательств штрафов")
+}
+
+Rel(rider, gateway, "Карты, платежи, штрафы, долг", "HTTPS/JSON")
+Rel(rider, psp, "Вводит карту на странице / в SDK PSP", "HTTPS")
+Rel(operator, gateway, "Admin API", "HTTPS/JSON")
+Rel(psp, gateway, "Webhook о статусах", "HTTPS, подпись HMAC")
+Rel(gateway, billing_api, "/api/v1/..., /admin/v1/..., /webhooks/v1/psp/{provider}", "HTTPS/JSON")
+Rel(trip_worker, billing_api, "Авторизация, отмена hold, статус", "HTTPS/JSON, mTLS")
+
+Rel(billing_api, psp, "Hold, отмена hold, привязка карты, оплата долга", "HTTPS/JSON")
+Rel(billing_settlement, psp, "Capture, доп. списание, возврат", "HTTPS/JSON")
+Rel(billing_recon, psp, "Статус операций, void, удаление токенов, реестры", "HTTPS/JSON, SFTP")
+Rel(billing_settlement, pricing_api, "POST /internal/v1/price-calculations; GET /internal/v1/signing-keys (JWKS)", "HTTPS/JSON, mTLS")
+Rel(billing_api, photo_api, "GET /internal/v1/photos/{photoId}", "HTTPS/JSON, mTLS")
+Rel(billing_api, geofence_api, "GET /internal/v1/violation-evidence/{evidenceId}", "HTTPS/JSON, mTLS")
+Rel(billing_recon, trip_api, "GET /internal/v1/trips/{tripId}", "HTTPS/JSON, mTLS")
+
+Rel(billing_api, billing_db, "Чтение/запись", "SQL")
+Rel(billing_settlement, billing_db, "Чтение/запись, очередь billing_job", "SQL")
+Rel(billing_recon, billing_db, "Чтение/запись, inbox webhook", "SQL")
+Rel(billing_recon, billing_archive, "Выгрузка партиций и реестров", "S3 API")
+
+Rel(cdc, billing_db, "Читает outbox_event из WAL", "logical replication")
+Rel(cdc, kafka, "billing.payment-status.v1, billing.fine.v1", "Kafka")
+Rel(kafka, billing_settlement, "trip.lifecycle.v1 (TripEnded), user.access.v1 (UserAccessChanged)", "Kafka")
+Rel(kafka, trip_worker, "billing.payment-status.v1, billing.fine.v1", "Kafka")
+Rel(kafka, user_worker, "billing.payment-status.v1, billing.fine.v1", "Kafka")
+Rel(kafka, photo_worker, "billing.fine.v1", "Kafka")
+
+SHOW_LEGEND()
+@enduml

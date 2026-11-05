@@ -1,0 +1,67 @@
+@startuml c3-photo-api
+!pragma layout smetana
+!include <C4/C4_Component>
+title C4 — C3: Photo API (Photo Service)
+LAYOUT_TOP_DOWN()
+
+Container(gateway, "API Gateway", "HTTPS reverse proxy", "JWT пользователя и оператора")
+Container(trip_worker, "Trip Saga Worker", "Kotlin, Spring Boot", "Сверка статуса фото парковки")
+Container(fleet_api, "Fleet API", "Kotlin, Spring Boot", "Проверка фото отчёта о повреждении")
+Container(billing_api, "Billing API", "Kotlin, Spring Boot", "Проверка фото обжалования")
+
+Container_Boundary(api, "Photo API") {
+  Component(security, "Security Filter Chain", "Spring Security", "JWT по JWKS (кеш), роли оператора; mTLS-идентичность и allowlist сервисов")
+  Component(public_ctrl, "Public Photo Controller", "Spring MVC", "/api/v1/photos/~*~*: upload-sessions, complete, GET, view-url")
+  Component(admin_ctrl, "Admin Photo Controller", "Spring MVC", "/admin/v1/photos/~*~*: поиск, просмотр с причиной, удержания, удаление")
+  Component(internal_ctrl, "Internal Photo Controller", "Spring MVC", "GET /internal/v1/photos/{photoId}")
+  Component(idem, "Idempotency Service", "Kotlin", "Idempotency-Key: повтор ответа, 422 при другом теле")
+  Component(session_svc, "Upload Session Service", "Kotlin", "purpose → subjectType, лимиты, дедуп по содержимому; строка фото до URL")
+  Component(complete_svc, "Upload Completion Service", "Kotlin", "HEAD: размер и SHA-256; UPLOADED + задание PROCESS")
+  Component(policy, "Access Policy", "Kotlin", "Владелец, роли и варианты просмотра; ранняя проверка штрафа по fine_ref")
+  Component(view_svc, "View URL Service", "Kotlin", "presigned GET на 5 мин; запись аудита до выдачи")
+  Component(hold_svc, "Hold & Deletion Service", "Kotlin", "Ручные удержания, запросы удаления и переобработки → задания worker")
+  Component(presigner, "URL Presigner", "AWS SDK v2 S3Presigner", "SigV4 локально, без сети: PUT с подписанными заголовками, GET")
+  Component(s3_client, "Object Storage Client", "AWS SDK v2 + Resilience4j", "HEAD; тайм-аут 300 мс, 1 повтор, circuit breaker")
+  Component(repo, "Photo Repositories", "Spring JDBC", "photo, photo_processing_job, photo_retention_hold, photo_access_audit, fine_ref, idempotency_record")
+}
+
+ContainerDb(photo_db, "Photo DB", "PostgreSQL", "Метаданные, задания, удержания, аудит")
+ContainerDb(photo_s3, "Photo Object Storage", "S3-совместимое, регион РФ", "scooter-photos-originals, scooter-photos-derivatives")
+Container(user_api, "User API", "Kotlin, Spring Boot", "JWKS")
+
+Rel(gateway, security, "Пользовательские и admin-запросы", "HTTPS/JSON, JWT")
+Rel(trip_worker, security, "GET /internal/v1/photos/{id} (RECONCILE_PHOTO)", "HTTPS/JSON, mTLS")
+Rel(fleet_api, security, "GET /internal/v1/photos/{id} (фото повреждения/осмотра)", "HTTPS/JSON, mTLS")
+Rel(billing_api, security, "GET /internal/v1/photos/{id} (создание обжалования)", "HTTPS/JSON, mTLS")
+Rel(security, user_api, "Ключи подписи JWT (кеш 5 мин, обновление при неизвестном kid)", "HTTPS, JWKS")
+
+Rel(security, public_ctrl, "Пользователь (sub)")
+Rel(security, admin_ctrl, "Оператор + роли")
+Rel(security, internal_ctrl, "Сервис из allowlist")
+
+Rel(public_ctrl, idem, "POST-команды")
+Rel(public_ctrl, session_svc, "Создать сессию")
+Rel(public_ctrl, complete_svc, "Завершить загрузку")
+Rel(public_ctrl, view_svc, "Ссылка на превью")
+Rel(admin_ctrl, view_svc, "Просмотр с причиной")
+Rel(admin_ctrl, hold_svc, "Удержания, удаление, reprocess")
+Rel(admin_ctrl, repo, "Поиск по субъекту/владельцу")
+Rel(internal_ctrl, repo, "Чтение по PK")
+
+Rel(session_svc, policy, "Назначение и владелец")
+Rel(view_svc, policy, "Права на вариант")
+Rel(session_svc, presigner, "presigned PUT, TTL 10 мин")
+Rel(view_svc, presigner, "presigned GET, TTL 5 мин")
+Rel(complete_svc, s3_client, "HEAD объекта")
+Rel(s3_client, photo_s3, "HeadObject (checksum mode)", "S3 API, HTTPS")
+
+Rel(idem, repo, "idempotency_record")
+Rel(session_svc, repo, "photo + задание CHECK_UPLOAD в одной транзакции")
+Rel(complete_svc, repo, "UPLOADED + задание PROCESS")
+Rel(view_svc, repo, "photo_access_audit")
+Rel(hold_svc, repo, "Удержание/запрос + задание")
+Rel(policy, repo, "fine_ref")
+Rel(repo, photo_db, "Транзакции, advisory lock", "SQL, PgBouncer")
+
+SHOW_LEGEND()
+@enduml
