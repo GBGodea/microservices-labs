@@ -1,0 +1,50 @@
+@startuml c3-telemetry-ingestor
+!pragma layout smetana
+!include <C4/C4_Component>
+title C4 — C3: Telemetry Ingestor (Telemetry Service)
+LAYOUT_TOP_DOWN()
+
+ContainerQueue(mqtt, "Канал устройств", "MQTT Broker, EMQX, mTLS", "$share/telemetry-ingestor/devices/+/telemetry")
+Container(vault, "Хранилище секретов", "Vault Transit", "Версии ключа Ed25519")
+
+Container_Boundary(ingestor, "Telemetry Ingestor") {
+  Component(subscriber, "MqttTelemetrySubscriber", "HiveMQ MQTT Client 5", "Shared-подписка QoS1, постоянная сессия, ручной PUBACK, Receive Maximum")
+  Component(decoder, "TelemetryDecoder", "Jackson", "JSON schemaVersion 1 -> TelemetryMessage; лимит 4 КБ; фиксирует receivedAt")
+  Component(validator, "MeasurementValidator", "Kotlin", "Схема, диапазоны, часы (measuredAt > receivedAt + 2 с -> CLOCK_SKEW, отклонение), флаги качества")
+  Component(dedup, "DuplicateFilter", "Caffeine LRU", "Уже обработанные (scooterId, bootId, seq) за 10 мин")
+  Component(factory, "MeasurementFactory", "UUIDv5", "measurementId, aggregateVersion, округление, усечение до мс")
+  Component(batcher, "BatchAssembler", "Kotlin coroutines, bounded channel", "Пакет 500 сообщ. / 50 мс; backpressure")
+  Component(signer, "MeasurementSigner", "Ed25519, BouncyCastle", "Каноническая строка, подпись, kid")
+  Component(keys, "SigningKeyProvider", "Vault client", "Активная версия (возраст >= 24 ч); зеркало публичных ключей")
+  Component(repo, "MeasurementRepository", "JDBC, INSERT ... unnest", "ON CONFLICT DO NOTHING; upsert последнего положения с проверкой версии")
+  Component(publisher, "LocationEventPublisher", "Kafka producer: idempotent, acks=all, zstd", "LocationObserved для новых измерений, кроме опоздавших")
+  Component(ack, "AckCoordinator", "Kotlin", "PUBACK строго по порядку после БД и Kafka")
+  Component(degrade, "DegradationController", "Resilience4j", "Circuit breaker БД и Kafka; режимы NORMAL / DB_ONLY / KAFKA_ONLY / STALLED")
+  Component(backfill, "KafkaBackfillLoader", "Kafka consumer, ручное назначение", "Дозапись в БД после отказа БД")
+}
+
+ContainerDb(telemetry_db, "Telemetry DB", "PostgreSQL + TimescaleDB", "telemetry_measurement, scooter_last_location, signing_key")
+ContainerQueue(kafka, "Доменные события", "Apache Kafka", "telemetry.location.v1")
+
+Rel(mqtt, subscriber, "PUBLISH измерений", "MQTT QoS1")
+Rel(subscriber, decoder, "Сырое сообщение + topic")
+Rel(decoder, validator, "TelemetryMessage")
+Rel(validator, dedup, "Валидное измерение")
+Rel(dedup, factory, "Новое измерение")
+Rel(factory, batcher, "Measurement")
+Rel(batcher, signer, "Пакет")
+Rel(signer, keys, "Текущий ключ и kid")
+Rel(keys, vault, "Экспорт ключа по версии", "HTTPS, mTLS")
+Rel(keys, repo, "Публичные ключи в signing_key")
+Rel(batcher, repo, "Подписанный пакет")
+Rel(repo, telemetry_db, "Пакетная вставка в одной транзакции", "SQL")
+Rel(batcher, publisher, "Закоммиченные измерения")
+Rel(publisher, kafka, "LocationObserved", "Kafka: telemetry.location.v1")
+Rel(batcher, ack, "Пакет завершён")
+Rel(ack, subscriber, "PUBACK по порядку")
+Rel(degrade, batcher, "Режим работы")
+Rel(backfill, kafka, "Перечитывает окно отказа", "Kafka")
+Rel(backfill, repo, "Пропущенные измерения")
+
+SHOW_LEGEND()
+@enduml

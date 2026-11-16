@@ -1,0 +1,61 @@
+@startuml c3-pricing-api
+!pragma layout smetana
+!include <C4/C4_Component>
+title C4 — C3: Pricing API (Pricing Service)
+LAYOUT_TOP_DOWN()
+
+Container(gateway, "API Gateway", "HTTPS reverse proxy", "Публичные и админ-маршруты")
+Container(trip_worker, "Trip Saga Worker", "Kotlin, Spring Boot", "Котировка при старте; проверка её подписи")
+Container(billing_settlement, "Billing Settlement Worker", "Kotlin, Spring Kafka", "Расчёт цены завершённой поездки; аудит подписи snapshot")
+Container(discovery_projector, "Discovery Projector", "Kotlin, Spring Kafka", "Перестроение цен в проекции")
+
+Container_Boundary(pricing_api, "Pricing API") {
+  Component(tariff_query_ctl, "TariffQueryController", "Spring MVC", "GET /api/v1/tariffs, GET /internal/v1/tariff-versions/current")
+  Component(admin_ctl, "AdminTariffController", "Spring MVC, RBAC", "/admin/v1/tariffs/**, /admin/v1/price-calculations")
+  Component(quote_ctl, "QuoteController", "Spring MVC, mTLS allowlist", "POST /internal/v1/quotes, GET /internal/v1/signing-keys")
+  Component(calc_ctl, "PriceCalculationController", "Spring MVC, mTLS allowlist", "POST /internal/v1/price-calculations")
+
+  Component(tariff_mgmt, "TariffManagementService", "Kotlin", "Черновик -> публикация, валидация, четыре глаза, effectiveFrom")
+  Component(quote_svc, "QuoteService", "Kotlin", "Тариф: priority, затем меньший tariffId; версия на requestedAt; сумма hold, snapshot, TTL 5 мин")
+  Component(calc_engine, "PriceCalculationEngine", "Kotlin, чистые функции", "Реестр алгоритмов по algorithmVersion; целочисленный расчёт")
+  Component(snapshot_signer, "SnapshotCanonicalizerAndSigner", "Kotlin, JCS + SHA-256 + Ed25519", "snapshotHash, подпись и проверка")
+  Component(catalog_cache, "TariffCatalogCache", "In-memory, Caffeine", "Текущие и будущие версии по городам; опрос ревизии каталога каждые 10 с")
+  Component(idem, "IdempotencyStore", "Kotlin", "idempotency_record для POST-команд")
+  Component(repos, "Repositories", "Spring JDBC / jOOQ", "tariff, tariff_version, quote, price_calculation")
+  Component(outbox, "OutboxWriter", "Kotlin", "TariffVersionPublished в outbox_event")
+}
+
+ContainerDb(pricing_db, "Pricing DB", "PostgreSQL", "Primary через PgBouncer")
+Container(secrets, "Секреты и ключи", "Vault / KMS", "Ключ Ed25519")
+
+Rel(gateway, tariff_query_ctl, "Тарифы города (JWT)", "HTTPS/JSON")
+Rel(gateway, admin_ctl, "Админ (PRICING_MANAGER)", "HTTPS/JSON")
+Rel(discovery_projector, tariff_query_ctl, "Текущие и следующие версии (перестроение, досинхронизация)", "HTTPS/JSON, mTLS")
+Rel(trip_worker, quote_ctl, "Котировка; signing-keys (JWKS)", "HTTPS/JSON, mTLS")
+Rel(billing_settlement, calc_ctl, "Расчёт по snapshot", "HTTPS/JSON, mTLS")
+Rel(billing_settlement, quote_ctl, "signing-keys (JWKS) для аудита snapshot", "HTTPS/JSON, mTLS")
+
+Rel(tariff_query_ctl, catalog_cache, "Чтение каталога")
+Rel(admin_ctl, tariff_mgmt, "Команды тарифов")
+Rel(admin_ctl, idem, "Idempotency-Key")
+Rel(quote_ctl, idem, "Idempotency-Key")
+Rel(quote_ctl, quote_svc, "Создать котировку")
+Rel(quote_ctl, snapshot_signer, "Публичные ключи (JWKS)")
+Rel(calc_ctl, calc_engine, "Рассчитать")
+Rel(quote_svc, catalog_cache, "Версия на requestedAt")
+Rel(quote_svc, snapshot_signer, "Хеш и подпись")
+Rel(calc_engine, snapshot_signer, "Проверка snapshotHash")
+Rel(calc_engine, catalog_cache, "Сверка с опубликованной версией")
+Rel(tariff_mgmt, outbox, "Событие публикации")
+
+Rel(tariff_mgmt, repos, "tariff, tariff_version FOR UPDATE")
+Rel(quote_svc, repos, "INSERT quote")
+Rel(calc_engine, repos, "INSERT ... ON CONFLICT DO NOTHING")
+Rel(catalog_cache, repos, "Загрузка и ревизия каталога")
+Rel(idem, repos, "idempotency_record")
+Rel(repos, pricing_db, "Чтение/запись", "SQL")
+Rel(outbox, pricing_db, "INSERT outbox_event", "SQL")
+Rel(snapshot_signer, secrets, "Приватный ключ по kid", "HTTPS, mTLS")
+
+SHOW_LEGEND()
+@enduml

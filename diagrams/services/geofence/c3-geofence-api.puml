@@ -1,0 +1,80 @@
+@startuml c3-geofence-api
+!pragma layout smetana
+!include <C4/C4_Component>
+title C4 — C3: Geofence API (Geofence Service)
+LAYOUT_TOP_DOWN()
+
+Container(trip_worker, "Trip Saga Worker", "Kotlin, Spring Boot", "Проверки старта и парковки")
+Container(discovery_projector, "Discovery Projector", "Kotlin, Spring Kafka", "Геометрия версии для карты")
+Container(billing_api, "Billing API", "Kotlin, Spring Boot", "Обжалование штрафа: свидетельство нарушения")
+Container(gateway, "API Gateway", "HTTPS reverse proxy", "JWT оператора, роль GEO_MANAGER")
+ContainerQueue(kafka, "Доменные события", "Apache Kafka", "geofence.version.v1")
+
+Container_Boundary(geo_api, "Geofence API") {
+  Component(check_ctl, "GeoCheckController", "Spring MVC", "POST /internal/v1/geo-checks/start|finish, GET /geo-checks/{id}; mTLS allowlist")
+  Component(read_ctl, "InternalReadController", "Spring MVC", "/internal/v1/geofence-versions/*, /violation-evidence/{id}; ETag, gzip")
+  Component(admin_ctl, "AdminGeofenceController", "Spring MVC", "/admin/v1/geofences, /geofence-versions; роли, Idempotency-Key, If-Match")
+  Component(updater, "VersionCacheUpdater", "Kafka consumer (assign) + @Scheduled", "Событие → загрузка версии → checksum → замена; сверка с БД раз в 60 с")
+
+  Component(check_svc, "GeoCheckService", "Kotlin", "Ключ (tripId, finishOperationId), порядок шагов, одна транзакция записи")
+  Component(version_svc, "GeofenceVersionService", "Kotlin", "DRAFT → VALIDATED → PUBLISHED; блокировка города; неизменяемость")
+
+  Component(verifier, "MeasurementVerifier", "Kotlin, Ed25519", "Строка TLM1 (Telemetry §3.3.1), подпись по kid, свежесть 30/60 с, точность ≤ 25 м, расхождение часов; lockState только фиксируется")
+  Component(evaluator, "ZonePolicyEvaluator", "Kotlin, JTS", "Матрица правил версии, допуск по accuracyM, decision + reasonCode")
+  Component(index, "SpatialIndexRegistry", "JTS STRtree + PreparedGeometry", "Индекс на город × previous/current/scheduled; атомарная замена ссылки")
+  Component(validator, "PostGisValidator", "SQL / PostGIS", "ST_IsValid, запрещённые пересечения, покрытие OPERATING_AREA")
+
+  Component(key_cache, "SigningKeyCache", "Caffeine + Resilience4j", "JWKS по kid: TTL 10 мин, single-flight, CB; резерв в БД")
+  Component(check_repo, "GeoCheckRepository", "Spring JDBC", "geo_check_key, geo_check, violation_evidence")
+  Component(version_repo, "GeofenceVersionRepository", "Spring JDBC", "geofence_version, geofence_zone (WKB), idempotency_record")
+  Component(outbox, "OutboxWriter", "Spring JDBC", "outbox_event в транзакции публикации")
+}
+
+Container(telemetry_api, "Telemetry API", "Kotlin, Spring Boot", "JWKS ключей подписи")
+ContainerDb(geo_db, "Geofence DB", "PostgreSQL + PostGIS", "Зоны (GiST), проверки, свидетельства, outbox")
+
+Lay_R(check_ctl, read_ctl)
+Lay_R(read_ctl, admin_ctl)
+Lay_R(admin_ctl, updater)
+Lay_R(verifier, evaluator)
+Lay_R(evaluator, index)
+Lay_R(index, validator)
+Lay_R(key_cache, check_repo)
+Lay_R(check_repo, version_repo)
+Lay_R(version_repo, outbox)
+Lay_R(telemetry_api, geo_db)
+
+Rel(trip_worker, check_ctl, "Проверка старта/парковки", "HTTPS/JSON, mTLS")
+Rel(discovery_projector, read_ctl, "GET /geofence-versions/current, /{versionId}", "HTTPS/JSON, mTLS")
+Rel(billing_api, read_ctl, "GET /violation-evidence/{id} (обжалование)", "HTTPS/JSON, mTLS")
+Rel(gateway, admin_ctl, "Админ-команды", "HTTPS/JSON, JWT")
+Rel(kafka, updater, "GeofenceVersionPublished", "Kafka: geofence.version.v1")
+
+Rel(check_ctl, check_svc, "Команда проверки")
+Rel(check_svc, verifier, "Проверить измерение")
+Rel(check_svc, evaluator, "Решение по точке")
+Rel(check_svc, check_repo, "Повтор? / запись результата")
+Rel(verifier, key_cache, "Ключ по kid")
+Rel(evaluator, index, "Зоны в радиусе accuracyM")
+
+Rel(read_ctl, index, "Текущая версия города")
+Rel(read_ctl, check_repo, "Свидетельство")
+Rel(read_ctl, version_repo, "Геометрия версии")
+
+Rel(admin_ctl, version_svc, "Черновик / валидация / публикация")
+Rel(version_svc, validator, "Проверить черновик")
+Rel(version_svc, version_repo, "Сохранить версию")
+Rel(version_svc, outbox, "GeofenceVersionPublished")
+
+Rel(updater, version_repo, "Зоны версии")
+Rel(updater, index, "Построить и заменить индекс")
+
+Rel(key_cache, telemetry_api, "GET /internal/v1/signing-keys", "HTTPS/JSON, mTLS")
+Rel(key_cache, geo_db, "Резервная копия JWKS", "SQL")
+Rel(check_repo, geo_db, "INSERT в одной транзакции", "SQL")
+Rel(version_repo, geo_db, "Версии, зоны", "SQL")
+Rel(outbox, geo_db, "outbox_event", "SQL")
+Rel(validator, geo_db, "Пространственные запросы", "SQL/PostGIS")
+
+SHOW_LEGEND()
+@enduml

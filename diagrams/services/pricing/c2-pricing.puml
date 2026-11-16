@@ -1,0 +1,39 @@
+@startuml c2-pricing
+!pragma layout smetana
+!include <C4/C4_Container>
+title C4 — C2: Pricing Service — контейнеры
+LAYOUT_TOP_DOWN()
+
+Person(rider, "Пользователь", "Смотрит тарифы города")
+Person(operator, "Оператор", "PRICING_MANAGER: черновики и публикация тарифов")
+
+System_Boundary(platform, "Платформа аренды самокатов") {
+  Container(gateway, "API Gateway", "HTTPS reverse proxy", "Маршрутизация, проверка JWT, квоты")
+  Container(trip_worker, "Trip Saga Worker", "Kotlin, Spring Boot", "Шаг saga: котировка при старте; проверка её подписи")
+  Container(billing_settlement, "Billing Settlement Worker", "Kotlin, Spring Kafka", "TripEnded -> расчёт цены -> списание; аудит подписи snapshot")
+  Container(discovery_projector, "Discovery Projector", "Kotlin, Spring Kafka", "Цена в карточке самоката; перестроение проекции")
+
+  Boundary(pricing_svc, "Pricing Service", $type="service") {
+    Container(pricing_api, "Pricing API", "Kotlin, Spring Boot", "Тарифы и версии, котировки с подписью, детерминированный расчёт цены; кеш каталога в памяти. Worker нет")
+    ContainerDb(pricing_db, "Pricing DB", "PostgreSQL", "Тарифы и версии; котировки (сутки, 7 дней); журнал расчётов (месяц, 13 мес.); outbox")
+  }
+
+  Container(outbox_cdc, "Outbox CDC", "Kafka Connect + Debezium", "Читает WAL, публикует outbox")
+  ContainerQueue(kafka, "Доменные события", "Apache Kafka + Schema Registry", "pricing.tariff-version.v1 (compact)")
+  Container(secrets, "Секреты и ключи", "Vault / KMS", "Приватный ключ Ed25519 подписи котировок")
+}
+
+Rel(rider, gateway, "Тарифы", "HTTPS/JSON")
+Rel(operator, gateway, "Админ-API тарифов", "HTTPS/JSON")
+Rel(gateway, pricing_api, "GET /api/v1/tariffs; /admin/v1/tariffs/~*~*, /admin/v1/price-calculations", "HTTPS/JSON")
+Rel(trip_worker, pricing_api, "POST /internal/v1/quotes, GET /internal/v1/signing-keys", "HTTPS/JSON, mTLS")
+Rel(billing_settlement, pricing_api, "POST /internal/v1/price-calculations, GET /internal/v1/signing-keys", "HTTPS/JSON, mTLS")
+Rel(discovery_projector, pricing_api, "GET /internal/v1/tariff-versions/current (перестроение, досинхронизация)", "HTTPS/JSON, mTLS")
+Rel(pricing_api, pricing_db, "Чтение/запись + outbox в одной транзакции", "SQL")
+Rel(pricing_api, secrets, "Ключ подписи по kid", "HTTPS, mTLS")
+Rel(outbox_cdc, pricing_db, "Читает WAL outbox_event", "logical replication")
+Rel(outbox_cdc, kafka, "TariffVersionPublished", "Kafka: pricing.tariff-version.v1")
+Rel(kafka, discovery_projector, "TariffVersionPublished", "Kafka: pricing.tariff-version.v1")
+
+SHOW_LEGEND()
+@enduml

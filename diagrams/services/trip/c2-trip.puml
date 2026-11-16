@@ -1,0 +1,56 @@
+@startuml c2-trip
+!pragma layout smetana
+!include <C4/C4_Container>
+title C4 — C2: Trip Service — контейнеры
+LAYOUT_TOP_DOWN()
+
+Person(rider, "Пользователь", "Стартует и завершает поездку, фотографирует парковку")
+Person(operator, "Оператор", "Разбор спорных поездок, принудительное завершение")
+
+System_Boundary(platform, "Платформа аренды самокатов") {
+  Container(gateway, "API Gateway", "HTTPS reverse proxy", "Проверка JWT, квоты, маршрут /api/v1/trips/~*~*")
+
+  Boundary(trip_svc, "Trip Service", $type="service") {
+    Container(trip_api, "Trip API", "Kotlin, Spring Boot", "Приём команд старта/завершения (202), чтение поездок и операций, admin-разбор, internal-статус поездки для сверки hold")
+    Container(trip_worker, "Trip Saga Worker", "Kotlin, Spring Boot", "Исполнение шагов durable saga, вызовы сервисов, компенсации, потребление событий, TripEnded")
+    ContainerDb(trip_db, "Trip DB", "PostgreSQL, primary + read replica", "trip, user_active_trip, trip_operation, saga_step, trip_transition, проекции, outbox/inbox")
+  }
+
+  Container(user_api, "User API", "Kotlin, Spring Boot", "Право старта, JWKS")
+  Container(geo_api, "Geofence API", "Kotlin, Spring Boot, JTS", "Проверки старта и парковки")
+  Container(pricing_api, "Pricing API", "Kotlin, Spring Boot", "Котировки и snapshot тарифа (JWS), ключи подписи")
+  Container(fleet_api, "Fleet API", "Kotlin, Spring Boot", "Самокат, lease, команды замку")
+  Container(billing_api, "Billing API", "Kotlin, Spring Boot", "Авторизация и отмена hold")
+  Container(photo_api, "Photo API", "Kotlin, Spring Boot", "Метаданные фото (сверка)")
+
+  Container(outbox_cdc, "Outbox CDC", "Kafka Connect + Debezium", "Читает WAL outbox_event, публикует в Kafka")
+  ContainerQueue(kafka, "Доменные события", "Apache Kafka + Schema Registry", "At least once, партиции по ключу агрегата")
+  Container(billing_settlement, "Billing Settlement Worker", "Kotlin, Spring Kafka", "Расчёт и списание по TripEnded")
+  Container(billing_recon, "Billing Reconciliation Worker", "Kotlin, Spring Boot", "Сверка осиротевших hold по статусу поездки")
+  ContainerDb(archive, "Archive Store", "S3-совместимое (платформа)", "Parquet-архив партиций > 13 мес. (5 лет, SSE, versioning, Object Lock на срок хранения), WAL и бэкапы")
+}
+
+Rel(rider, gateway, "Старт, завершение, статус, история", "HTTPS/JSON")
+Rel(operator, gateway, "Разбор, force-finish, решения сверки", "HTTPS/JSON")
+Rel(gateway, trip_api, "/api/v1/trips/~*~*, /admin/v1/trips/~*~*, /admin/v1/trip-reviews/~*~*", "HTTPS/JSON, JWT")
+Rel(billing_recon, trip_api, "GET /internal/v1/trips/{tripId}", "HTTPS/JSON, mTLS")
+
+Rel(trip_api, trip_db, "Команда = одна транзакция; точечные чтения; история с реплики", "SQL, PgBouncer")
+Rel(trip_api, user_api, "JWKS (кеш 5 мин)", "HTTPS")
+
+Rel(trip_worker, trip_db, "Шаги saga (FOR UPDATE SKIP LOCKED), переходы, проекции, outbox", "SQL, PgBouncer")
+Rel(trip_worker, user_api, "rental-eligibility", "HTTPS/JSON, mTLS")
+Rel(trip_worker, geo_api, "geo-checks/start, geo-checks/finish; GET geo-checks/{id} — сверка для разбора", "HTTPS/JSON, mTLS")
+Rel(trip_worker, pricing_api, "quotes, signing-keys (JWKS, кеш 5 мин)", "HTTPS/JSON, mTLS")
+Rel(trip_worker, fleet_api, "scooter, leases, commands, release; GET commands?leaseId, GET leases при сверке", "HTTPS/JSON, mTLS")
+Rel(trip_worker, billing_api, "payment-authorizations (4 с), опрос GET, cancel", "HTTPS/JSON, mTLS")
+Rel(trip_worker, photo_api, "GET photo при сверке (RECONCILE_PHOTO)", "HTTPS/JSON, mTLS")
+Rel(trip_worker, archive, "Выгрузка старых партиций", "S3 API, Parquet")
+
+Rel(outbox_cdc, trip_db, "Читает outbox_event из WAL", "logical replication")
+Rel(outbox_cdc, kafka, "TripEnded", "Kafka: trip.lifecycle.v1")
+Rel(kafka, trip_worker, "device-command, payment-status, fine, access, photo.status", "Kafka, group trip-saga-worker")
+Rel(kafka, billing_settlement, "TripEnded", "Kafka: trip.lifecycle.v1")
+
+SHOW_LEGEND()
+@enduml

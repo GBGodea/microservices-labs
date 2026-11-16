@@ -1,0 +1,51 @@
+@startuml c3-discovery-api
+!pragma layout smetana
+!include <C4/C4_Component>
+title C4 — C3: Discovery API (Discovery Service)
+LAYOUT_TOP_DOWN()
+
+Container(gateway, "API Gateway", "HTTPS reverse proxy", "JWT пользователя/оператора, квоты")
+
+Container_Boundary(api, "Discovery API") {
+  Component(search_ctrl, "SearchController", "Spring WebFlux", "GET /api/v1/scooters/nearby")
+  Component(card_ctrl, "CardController", "Spring WebFlux", "GET /api/v1/scooters/{scooterId}/card")
+  Component(map_ctrl, "MapController", "Spring WebFlux", "GET /api/v1/map/geofences; ETag")
+  Component(rebuild_ctrl, "RebuildAdminController", "Spring WebFlux", "POST/GET /admin/v1/discovery/rebuilds")
+  Component(city_resolver, "CityResolver", "JTS STRtree", "Точка -> cityId по OPERATING_AREA")
+  Component(nearby_svc, "NearbySearchService", "Kotlin coroutines", "Квантование, точная дистанция, сортировка, limit")
+  Component(response_cache, "NearbyResponseCache", "Caffeine, TTL 2 с", "Ключ (cityId, gen, geohash7, радиус-корзина)")
+  Component(freshness, "FreshnessPolicy", "Kotlin", "Скрывает положения старше 15 с; availability")
+  Component(tariff_sel, "TariffSelector", "Kotlin, кеш 5 с", "Версия по времени; applicableModels; priority desc, tariffId asc")
+  Component(gen_resolver, "GenerationResolver", "Caffeine, TTL 1 с", "Активное поколение ключей города")
+  Component(zone_svc, "ZoneMapService", "JTS STRtree", "Зоны города по bbox; кеш по (cityId, version)")
+  Component(rebuild_cmd, "RebuildCommandService", "Kotlin", "Idempotency-Key, XADD в поток запросов")
+  Component(index_reader, "IndexReader", "Lettuce, REPLICA_PREFERRED", "Тайм-аут 50 мс, circuit breaker")
+}
+
+ContainerDb(discovery_index, "Discovery Index", "Redis Cluster", "dsc:{cityId}:g{n}:*")
+
+Rel(gateway, search_ctrl, "Поиск рядом", "HTTPS/JSON")
+Rel(gateway, card_ctrl, "Карточка", "HTTPS/JSON")
+Rel(gateway, map_ctrl, "Карта зон", "HTTPS/JSON")
+Rel(gateway, rebuild_ctrl, "Пересборка", "HTTPS/JSON")
+Rel(search_ctrl, nearby_svc, "lat, lon, radiusM, limit")
+Rel(nearby_svc, city_resolver, "Город точки")
+Rel(nearby_svc, response_cache, "Ответ по ячейке")
+Rel(nearby_svc, freshness, "Фильтр кандидатов")
+Rel(nearby_svc, gen_resolver, "Поколение")
+Rel(response_cache, index_reader, "Промах: GEOSEARCH + HMGET")
+Rel(card_ctrl, index_reader, "HGET карточки")
+Rel(card_ctrl, freshness, "available")
+Rel(nearby_svc, tariff_sel, "Тариф на модель")
+Rel(card_ctrl, tariff_sel, "Тариф модели, next")
+Rel(tariff_sel, index_reader, "HGETALL tariffs")
+Rel(map_ctrl, zone_svc, "cityId, bbox")
+Rel(zone_svc, index_reader, "HSCAN зон при смене checksum")
+Rel(rebuild_ctrl, rebuild_cmd, "Команда / статус")
+Rel(rebuild_cmd, index_reader, "XADD, HGETALL статуса")
+Rel(city_resolver, zone_svc, "Полигоны OPERATING_AREA")
+Rel(gen_resolver, index_reader, "GET gen")
+Rel(index_reader, discovery_index, "Чтение с реплик; запись команд на primary", "RESP3, TLS")
+
+SHOW_LEGEND()
+@enduml

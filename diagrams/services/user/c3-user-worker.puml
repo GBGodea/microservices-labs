@@ -1,0 +1,56 @@
+@startuml c3-user-worker
+!pragma layout smetana
+!include <C4/C4_Component>
+title C4 — C3: User Worker (User Service)
+LAYOUT_TOP_DOWN()
+
+ContainerQueue(kafka, "Доменные события", "Apache Kafka", "billing.payment-status.v1, billing.fine.v1; DLQ-топики")
+
+Container_Boundary(user_worker, "User Worker") {
+  Component(pay_consumer, "PaymentStatusConsumer", "Spring Kafka, group user-worker", "PaymentStatusChanged -> outstandingDebtMinor, debtVersion")
+  Component(fine_consumer, "FineConsumer", "Spring Kafka, group user-worker", "FineIssued, FineStatusChanged")
+  Component(error_handler, "RetryAndDlqHandler", "DefaultErrorHandler", "Временные ошибки (БД): пауза партиции, повтор на месте 1 с -> 60 с, без DLQ; постоянные (схема, десериализация, неизвестный userId) -> сразу .dlq.user-worker")
+  Component(inbox, "InboxDeduplicator", "Kotlin", "INSERT inbox_message ON CONFLICT DO NOTHING")
+  Component(fin_projection, "FinancialProjectionUpdater", "Kotlin", "Долг по debtVersion, штрафы по aggregateVersion; старые события игнорируются")
+  Component(access_recalc, "AccessRecalculator", "Kotlin, общая AccessPolicy", "Пересчёт статуса из полного состояния под FOR UPDATE; accessVersion + 1")
+  Component(restriction_sched, "RestrictionScheduler", "Spring Scheduler, SKIP LOCKED", "Истечение льготного срока штрафа и срока блокировки")
+  Component(deletion_proc, "AccountDeletionProcessor", "Spring Scheduler, SKIP LOCKED", "Заявки на удаление: ожидание, удержание при долге, запуск обезличивания")
+  Component(anonymizer, "PiiAnonymizer", "Kotlin", "Удаление ПДн, сессий, OTP; статус DELETED")
+  Component(cleanup, "ExpiredDataCleaner", "Spring Scheduler", "Батчевое удаление OTP, сессий, inbox, idempotency")
+  Component(key_rotator, "SigningKeyRotator", "Spring Scheduler, advisory lock", "NEXT -> ACTIVE -> RETIRED, ключ ES256 раз в 30 дней")
+  Component(repos, "Repositories", "Spring JDBC / jOOQ", "user_financial_state, user_fine_projection, user_access, deletion, session")
+  Component(outbox, "OutboxWriter", "Kotlin", "UserAccessChanged в outbox_event")
+}
+
+ContainerDb(user_db, "User DB", "PostgreSQL", "Primary через PgBouncer")
+Container(secrets, "Секреты и ключи", "Vault / KMS", "Приватные ключи JWT")
+
+Rel(kafka, pay_consumer, "PaymentStatusChanged", "Kafka: billing.payment-status.v1")
+Rel(kafka, fine_consumer, "FineIssued, FineStatusChanged", "Kafka: billing.fine.v1")
+Rel(pay_consumer, error_handler, "Исключения")
+Rel(fine_consumer, error_handler, "Исключения")
+Rel(error_handler, kafka, "Постоянные ошибки", "Kafka: <topic>.dlq.user-worker")
+Rel(pay_consumer, inbox, "Дедуп eventId")
+Rel(fine_consumer, inbox, "Дедуп eventId")
+Rel(pay_consumer, fin_projection, "Новый долг")
+Rel(fine_consumer, fin_projection, "Новый статус штрафа")
+Rel(fin_projection, access_recalc, "Пересчитать доступ")
+Rel(restriction_sched, access_recalc, "Пересчитать доступ")
+Rel(deletion_proc, anonymizer, "Обезличить")
+Rel(anonymizer, access_recalc, "Статус DELETED")
+Rel(access_recalc, outbox, "Изменился статус/причины")
+
+Rel(inbox, repos, "inbox_message")
+Rel(fin_projection, repos, "Проекции долга и штрафов")
+Rel(access_recalc, repos, "user_access FOR UPDATE")
+Rel(restriction_sched, repos, "Готовые к пересчёту строки")
+Rel(deletion_proc, repos, "account_deletion_request")
+Rel(anonymizer, repos, "DELETE user_pii, сессий, OTP")
+Rel(cleanup, repos, "DELETE ... LIMIT 5000")
+Rel(key_rotator, repos, "jwt_signing_key")
+Rel(repos, user_db, "Чтение/запись", "SQL")
+Rel(outbox, user_db, "INSERT outbox_event", "SQL")
+Rel(key_rotator, secrets, "Сгенерировать и сохранить ключ", "HTTPS, mTLS")
+
+SHOW_LEGEND()
+@enduml

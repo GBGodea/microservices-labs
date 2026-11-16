@@ -1,0 +1,58 @@
+@startuml c2-fleet
+!pragma layout smetana
+!include <C4/C4_Container>
+title C4 — C2: Fleet Service — контейнеры
+LAYOUT_TOP_DOWN()
+
+Person(rider, "Пользователь", "Сообщает о повреждении самоката")
+Person(operator, "Оператор", "Парк, обслуживание, разбор отчётов")
+System_Ext(scooter, "Бортовая система самоката", "Замок, GPS; хранит последний fencing token, проверяет expiresAt")
+
+System_Boundary(platform, "Платформа аренды самокатов") {
+  Container(gateway, "API Gateway", "HTTPS reverse proxy", "JWT, маршрутизация /api/v1 и /admin/v1")
+  Container(trip_worker, "Trip Saga Worker", "Kotlin, Spring Boot", "Шаги saga старта и завершения")
+  Container(discovery_projector, "Discovery Projector", "Kotlin, Spring Kafka", "Геоиндекс; перестроение из snapshot")
+  Container(telemetry_api, "Telemetry API", "Kotlin, Spring Boot", "Последнее подписанное измерение")
+  Container(telemetry_ingestor, "Telemetry Ingestor", "Kotlin, MQTT client", "Подписывает измерения")
+  Container(photo_worker, "Photo Processing Worker", "Kotlin, Spring Boot", "Проверка фото, статусы")
+  Container(photo_api, "Photo API", "Kotlin, Spring Boot", "Метаданные фото: владелец, предмет, статус")
+
+  Boundary(fleet_svc, "Fleet Service", $type="service") {
+    Container(fleet_api, "Fleet API", "Kotlin, Spring Boot", "Состояние самоката, lease + fencing token, приём команд в очередь, обслуживание, отчёты о повреждениях")
+    Container(fleet_cmd_worker, "Fleet Command Worker", "Kotlin, MQTT client", "Отправка команд, результаты и state, тайм-ауты, сверка QUERY_STATE, истечение PREPARING lease")
+    Container(fleet_event_worker, "Fleet Event Worker", "Kotlin, Spring Kafka", "Проекция последнего подписанного измерения (батч-UPSERT), LOW_BATTERY/OFFLINE, статусы фото повреждений")
+    ContainerDb(fleet_db, "Fleet DB", "PostgreSQL", "scooter, scooter_active_lease, scooter_lease, device_command(+queue), scooter_last_measurement, damage_report, outbox/inbox")
+  }
+
+  ContainerQueue(mqtt, "Канал устройств", "EMQX-кластер, mTLS", "devices/{scooterId}/commands, command-results, state")
+  ContainerQueue(kafka, "Доменные события", "Apache Kafka + Schema Registry", "At least once, ключ — id агрегата")
+  Container(cdc, "Outbox CDC", "Kafka Connect + Debezium", "Читает WAL outbox_event, публикует в Kafka")
+}
+
+Rel(rider, gateway, "POST damage-reports", "HTTPS/JSON")
+Rel(operator, gateway, "Админ-API парка", "HTTPS/JSON")
+Rel(gateway, fleet_api, "Отчёты о повреждениях; админ-API парка и отчётов", "HTTPS/JSON, JWT")
+Rel(trip_worker, fleet_api, "Состояние, lease, команды, release", "HTTPS/JSON, mTLS")
+Rel(discovery_projector, fleet_api, "GET scooters/snapshot", "HTTPS/JSON, mTLS")
+Rel(fleet_api, telemetry_api, "Свежее измерение, если проекция устарела", "HTTPS/JSON, mTLS")
+Rel(telemetry_api, fleet_api, "cityId самоката (GET scooters/{id}, без fallback)", "HTTPS/JSON, mTLS")
+Rel(fleet_api, photo_api, "Метаданные фото отчёта, если нет в проекции", "HTTPS/JSON, mTLS")
+
+Rel(fleet_api, fleet_db, "Lease, команда в очередь + outbox в одной транзакции", "SQL")
+Rel(fleet_cmd_worker, fleet_db, "Очередь FOR UPDATE SKIP LOCKED, статусы, lease, outbox", "SQL")
+Rel(fleet_event_worker, fleet_db, "Батч-UPSERT ~1 раз/с, availability, outbox", "SQL")
+
+Rel(fleet_cmd_worker, mqtt, "Публикует devices/{id}/commands", "MQTT 5 QoS1")
+Rel(mqtt, fleet_cmd_worker, "command-results, state ($share/fleet-command-worker)", "MQTT 5 QoS1")
+BiRel(scooter, mqtt, "Команды / результаты, state, LWT", "MQTT/TLS QoS1")
+
+Rel(telemetry_ingestor, kafka, "telemetry.location.v1", "Kafka")
+Rel(photo_worker, kafka, "photo.status.v1", "Kafka")
+Rel(kafka, fleet_event_worker, "telemetry.location.v1, photo.status.v1", "Kafka, group fleet-event-worker")
+Rel(cdc, fleet_db, "Читает WAL outbox_event", "logical replication")
+Rel(cdc, kafka, "fleet.scooter-availability.v1, fleet.device-command.v1", "Kafka")
+Rel(kafka, trip_worker, "fleet.device-command.v1", "Kafka")
+Rel(kafka, discovery_projector, "fleet.scooter-availability.v1", "Kafka")
+
+SHOW_LEGEND()
+@enduml

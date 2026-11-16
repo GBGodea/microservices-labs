@@ -1,0 +1,56 @@
+@startuml c3-billing-settlement-worker
+!pragma layout smetana
+!include <C4/C4_Component>
+title C4 — C3: Billing Settlement Worker (Billing Service)
+LAYOUT_TOP_DOWN()
+
+ContainerQueue(kafka, "Доменные события", "Apache Kafka", "trip.lifecycle.v1 (TripEnded), user.access.v1 (UserAccessChanged); по 24 партиции")
+Container(pricing_api, "Pricing API", "Kotlin, Spring Boot", "POST /internal/v1/price-calculations; GET /internal/v1/signing-keys (JWKS)")
+System_Ext(psp, "Платёжный провайдер (PSP)", "Capture, charge по токену, refund")
+ContainerDb(billing_db, "Billing DB", "PostgreSQL 17 (через PgBouncer)", "trip_settlement, billing_job, payment_operation, payment, fine, ledger, outbox, inbox")
+
+Container_Boundary(settle, "Billing Settlement Worker") {
+  Component(consumer, "TripEndedConsumer", "Spring Kafka, group billing-settlement-worker", "Читает TripEnded, коммит offset после локальной транзакции")
+  Component(access_consumer, "UserAccessConsumer", "Spring Kafka, group billing-settlement-worker", "Читает UserAccessChanged; действует только на DELETED, остальные статусы игнорирует")
+  Component(closure, "AccountClosureHandler", "Kotlin", "aggregateVersion > access_version: способы оплаты → REMOVED, psp_token_enc := NULL, задания DELETE_PSP_TOKEN; финансовые записи 5 лет, псевдонимизированно")
+  Component(inbox, "Inbox Deduplicator", "SQL", "inbox_message (consumer_group, event_id)")
+  Component(intake, "SettlementIntake", "Kotlin", "Одна транзакция: inbox + trip_settlement + job SETTLE_TRIP + штраф")
+  Component(fine_assessor, "FineAssessor", "Kotlin, domain", "ALLOWED_WITH_VIOLATION + USER_FINISH → FinePolicy по (cityId, reasonCode) на endedAt → Fine (AUTO) + FineIssued; NOT_CHECKED → без автоштрафа")
+  Component(runner, "Job Runner", "Kotlin, @Scheduled", "billing_job: FOR UPDATE SKIP LOCKED, claim на 60 с, backoff + jitter")
+  Component(processor, "SettlementProcessor", "Kotlin", "Автомат: расчёт → план списания → операции PSP → CAPTURED / RETRYING / DEBT")
+  Component(planner, "CapturePlanner", "Kotlin, domain", "hold vs итог: частичный capture, capture + CHARGE, полный CHARGE, void")
+  Component(dunning, "DunningPolicy", "Kotlin, domain", "Расписание повторов, перевод в DEBT, списание штрафов после окна обжалования")
+  Component(refunds, "RefundExecutor", "Kotlin", "REFUND по заявкам FINANCE и отменённым оплаченным штрафам")
+  Component(pricing_client, "Pricing Client", "WebClient, Resilience4j", "price-calculations: тайм-аут 1 с, 2 повтора, circuit breaker; signing-keys: 300 мс, 1 повтор, кеш JWKS 5 мин")
+  Component(psp_client, "PSP Client (ACL)", "Kotlin, Resilience4j", "Пул workers: тайм-аут 5 с, bulkhead, rate limiter, CB; ключ {tripId}:{op}:{seq}")
+  Component(ledger, "Ledger & Outbox Writer", "Kotlin, JDBC", "Проводки double-entry + PaymentStatusChanged / FineIssued / FineStatusChanged в outbox")
+  Component(repos, "Repositories", "Spring JDBC", "trip_settlement, billing_job, payment_operation, payment, fine, fine_policy_version, payment_method, user_billing_account")
+}
+
+Rel(kafka, consumer, "TripEnded", "Kafka")
+Rel(consumer, intake, "Событие")
+Rel(intake, inbox, "Дедуп eventId")
+Rel(intake, fine_assessor, "finishCheck, parkingPhoto")
+Rel(kafka, access_consumer, "UserAccessChanged", "Kafka")
+Rel(access_consumer, inbox, "Дедуп eventId")
+Rel(access_consumer, closure, "status = DELETED")
+Rel(closure, repos, "payment_method, billing_job, user_billing_account в одной транзакции")
+Rel(runner, processor, "SETTLE_TRIP, RETRY_CHARGE, CHARGE_FINE")
+Rel(runner, refunds, "EXECUTE_REFUND")
+Rel(processor, pricing_client, "Аудит подписи snapshot, итоговая цена")
+Rel(pricing_client, pricing_api, "price-calculations, signing-keys (JWKS)", "HTTPS/JSON, mTLS")
+Rel(processor, planner, "hold, итог")
+Rel(processor, dunning, "Отказ → следующий шаг")
+Rel(processor, psp_client, "capture / charge / void")
+Rel(refunds, psp_client, "refund")
+Rel(psp_client, psp, "Вызовы с Idempotence-Key", "HTTPS/JSON")
+Rel(processor, ledger, "Исход операции")
+Rel(refunds, ledger, "Исход возврата")
+Rel(fine_assessor, ledger, "Начисление штрафа")
+Rel(inbox, repos, "INSERT inbox_message")
+Rel(ledger, repos, "INSERT в транзакции")
+Rel(runner, repos, "Выбор и claim заданий")
+Rel(repos, billing_db, "Чтение/запись", "SQL")
+
+SHOW_LEGEND()
+@enduml

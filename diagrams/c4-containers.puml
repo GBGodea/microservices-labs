@@ -1,59 +1,126 @@
 @startuml c4-containers
 !pragma layout smetana
 !include <C4/C4_Container>
-title C4 — C2: приложения и взаимодействия (хранилища — отдельный вид c4-data)
+title C4 — C2: контейнеры и синхронные взаимодействия (события — c4-events, хранилища — c4-data)
 LAYOUT_TOP_DOWN()
 
-Person(rider, "Пользователь", "Арендует самокат")
-Person(operator, "Оператор", "Управляет парком и политиками через административный клиент")
-System_Ext(scooter, "Бортовая система самоката", "GPS, heartbeat, замок, подтверждения команд")
-System_Ext(psp, "Платёжный провайдер", "Авторизация, списание, возврат, webhook")
+Person(rider, "Пользователь", "Арендует самокат, фотографирует парковку")
+Person(operator, "Оператор", "Парк, зоны, тарифы, споры")
+System_Ext(scooter, "Бортовая система самоката", "GPS, замок, подтверждения команд")
+System_Ext(psp, "Платёжный провайдер (PSP)", "Авторизация, списание, возврат, webhook")
+System_Ext(sms, "SMS-шлюз", "Доставка OTP")
+System_Ext(idp, "Корпоративный OIDC IdP", "Вход операторов с MFA; JWT с roles[], cityIds[]")
 
 System_Boundary(platform, "Платформа аренды самокатов") {
-  Container(app, "Мобильное приложение", "iOS / Android", "Карта, управление поездкой, история и статус оплаты")
-  Container(gateway, "API Gateway", "HTTPS reverse proxy", "Маршрутизация, проверка токенов, квоты и отдельные пулы сценариев")
-  Container(user, "User Service", "REST API", "Пользователи, идентификация, право старта")
-  Container(discovery, "Discovery Service", "REST API + Kafka consumer", "Поиск по собственной геопроекции без RPC fan-out")
-  Container(trip, "Trip Service", "REST API + durable workers", "Trip, жизненный цикл и saga; завершение независимо от платежей")
-  Container(fleet, "Fleet Service", "REST API + MQTT workers", "Scooter, исключительный lease, команды и сверка")
-  Container(telemetry, "Telemetry Service", "MQTT ingestion + workers", "Location, валидация и история измерений")
-  Container(pricing, "Pricing Service", "REST API", "Tariff, неизменяемые версии, котировки и расчёт")
-  Container(geo, "Geofence Service", "REST API + geo engine", "Geofence, проверки, версии политик и свидетельства")
-  Container(billing, "Billing Service", "REST API + workers", "Payment, Fine, финансовый учёт и ACL провайдера")
-  ContainerQueue(bus, "Доменные события", "Apache Kafka", "At least once; outbox/inbox; партиции по агрегату; DLQ")
-  ContainerQueue(mqtt, "Канал устройств", "MQTT broker", "Аутентифицированные подключения; команды, ACK и телеметрия")
+  Container(app, "Мобильное приложение", "iOS / Android", "Карта, поездка, фото, оплата")
+  Container(gateway, "API Gateway", "HTTPS reverse proxy", "Маршруты /api, /admin, /webhooks; JWT; квоты")
+  ContainerQueue(mqtt, "Канал устройств", "MQTT Broker, EMQX-кластер, mTLS", "Команды, результаты, телеметрия")
+
+  Boundary(user_svc, "User Service", $type="service") {
+    Container(user_api, "User API", "Kotlin, Spring Boot", "OTP-вход, токены, профиль, право старта, JWKS")
+    Container(user_worker, "User Worker", "Kotlin, Spring Kafka", "Финансовые ограничения, удаление ПДн")
+  }
+  Boundary(discovery_svc, "Discovery Service", $type="service") {
+    Container(discovery_api, "Discovery API", "Kotlin, Spring WebFlux", "Поиск рядом, карточка, карта зон")
+    Container(discovery_projector, "Discovery Projector", "Kotlin, Spring Kafka", "Геоиндекс из событий; перестроение из snapshot")
+  }
+  Boundary(trip_svc, "Trip Service", $type="service") {
+    Container(trip_api, "Trip API", "Kotlin, Spring Boot", "Команды старта/завершения (202), чтение поездок")
+    Container(trip_worker, "Trip Saga Worker", "Kotlin, Spring Boot", "Шаги durable saga, компенсации, TripEnded")
+  }
+  Boundary(pricing_svc, "Pricing Service", $type="service") {
+    Container(pricing_api, "Pricing API", "Kotlin, Spring Boot", "Тарифы, котировки, расчёт цены")
+  }
+  Boundary(billing_svc, "Billing Service", $type="service") {
+    Container(billing_api, "Billing API", "Kotlin, Spring Boot", "Способы оплаты, авторизации, штрафы, webhook")
+    Container(billing_settlement, "Billing Settlement Worker", "Kotlin, Spring Kafka", "TripEnded → расчёт → списание; долги, штрафы")
+    Container(billing_recon, "Billing Reconciliation Worker", "Kotlin, Spring Boot", "Webhook-inbox, сверка с PSP, поздние hold")
+  }
+  Boundary(geo_svc, "Geofence Service", $type="service") {
+    Container(geo_api, "Geofence API", "Kotlin, Spring Boot, JTS", "Проверки старта/парковки, версии зон, свидетельства")
+  }
+  Boundary(photo_svc, "Photo Service", $type="service") {
+    Container(photo_api, "Photo API", "Kotlin, Spring Boot", "Сессии загрузки, presigned URL, метаданные, удержания")
+    Container(photo_worker, "Photo Processing Worker", "Kotlin, Spring Boot", "Проверка, превью, дедуп/pHash, ретенция")
+    ContainerDb(s3, "Photo Object Storage", "S3-совместимое хранилище", "Оригиналы (Object Lock) и превью")
+  }
+  Boundary(fleet_svc, "Fleet Service", $type="service") {
+    Container(fleet_api, "Fleet API", "Kotlin, Spring Boot", "Состояние, lease, приём команд, повреждения")
+    Container(fleet_cmd_worker, "Fleet Command Worker", "Kotlin, MQTT client", "Команды в MQTT, результаты, тайм-ауты, сверка")
+    Container(fleet_event_worker, "Fleet Event Worker", "Kotlin, Spring Kafka", "Проекция телеметрии, статусы фото повреждений")
+  }
+  Boundary(telemetry_svc, "Telemetry Service", $type="service") {
+    Container(telemetry_ingestor, "Telemetry Ingestor", "Kotlin, MQTT client", "Приём, дедуп, пакетная запись, подпись Ed25519")
+    Container(telemetry_api, "Telemetry API", "Kotlin, Spring Boot", "Последнее измерение, история, snapshot, JWKS")
+  }
 }
 
-Rel(rider, app, "Ищет и арендует")
-Rel(app, gateway, "Вызывает API и читает статус операции", "HTTPS/REST")
-Rel(operator, gateway, "Вызывает административные API", "HTTPS/REST")
-Rel(gateway, user, "Профиль и вход", "REST")
-Rel(gateway, discovery, "Поиск и карта", "REST")
-Rel(gateway, trip, "Старт, статус, завершение, история", "REST")
-Rel(gateway, billing, "Платежи, штрафы и обращения", "REST")
-Rel(gateway, fleet, "Управление парком", "REST, operator")
-Rel(gateway, pricing, "Управление тарифами", "REST, operator")
-Rel(gateway, geo, "Управление зонами", "REST, operator")
-Rel(trip, user, "Проверяет право нового старта", "REST")
-Rel(trip, fleet, "Захватывает ресурс, запрашивает замок и результат", "REST")
-Rel(trip, pricing, "Получает котировку/snapshot", "REST")
-Rel(trip, geo, "Проверяет старт и парковку", "REST")
-Rel(trip, billing, "Запрашивает/отменяет авторизацию при старте", "REST")
-Rel(billing, pricing, "Считает итог по snapshot; при сбое ожидает", "REST")
-Rel(billing, psp, "Авторизует, списывает, возвращает, сверяет", "HTTPS")
-Rel(psp, billing, "Передаёт платёжный статус", "Signed HTTPS webhook")
-BiRel(fleet, mqtt, "Отправляет команды; принимает результат устройства", "MQTT")
-Rel(scooter, mqtt, "Публикует GPS, heartbeat и результаты команд", "MQTT/TLS")
-Rel(mqtt, scooter, "Доставляет команды с ID и сроком", "MQTT/TLS")
-Rel(mqtt, telemetry, "Доставляет измерения", "MQTT")
-BiRel(user, bus, "Публикует доступ; читает финансовые статусы", "Kafka")
-BiRel(fleet, bus, "Публикует доступность/команды; читает измерения", "Kafka")
-Rel(telemetry, bus, "Публикует LocationObserved", "Kafka")
-Rel(bus, discovery, "Доставляет доступность, координаты, тарифы и зоны", "Kafka")
-BiRel(trip, bus, "Публикует TripEnded; читает команды/доступ/расчёты", "Kafka")
-Rel(pricing, bus, "Публикует TariffVersionPublished", "Kafka")
-BiRel(geo, bus, "Публикует версии зон; читает координаты", "Kafka")
-BiRel(billing, bus, "Читает TripEnded; публикует расчёты и штрафы", "Kafka")
+' --- Внешний вход
+Rel(rider, app, "Ищет, арендует, фотографирует")
+Rel(app, gateway, "/api/v1/**", "HTTPS/JSON")
+Rel(operator, gateway, "/admin/v1/**", "HTTPS/JSON")
+Rel(operator, idp, "Вход с MFA", "OIDC")
+Rel(psp, gateway, "Webhook статусов", "HTTPS, подпись")
+Rel(app, s3, "PUT/GET фото по presigned URL", "HTTPS, S3 API")
+
+' --- Gateway -> API (маршрутизация)
+Rel(gateway, user_api, "auth, users; JWKS", "HTTPS")
+Rel(gateway, discovery_api, "поиск, карта", "HTTPS")
+Rel(gateway, trip_api, "trips", "HTTPS")
+Rel(gateway, pricing_api, "tariffs", "HTTPS")
+Rel(gateway, billing_api, "платежи, штрафы, webhook", "HTTPS")
+Rel(gateway, geo_api, "admin: зоны", "HTTPS")
+Rel(gateway, photo_api, "photos", "HTTPS")
+Rel(gateway, fleet_api, "повреждения, admin", "HTTPS")
+Rel(gateway, telemetry_api, "admin: история", "HTTPS")
+Rel(gateway, idp, "JWKS (JWT операторов)", "HTTPS")
+
+' --- Durable saga поездки (/internal/v1, mTLS)
+Rel(trip_worker, user_api, "rental-eligibility", "HTTPS/JSON, mTLS")
+Rel(trip_worker, fleet_api, "состояние, lease, команды, release", "HTTPS/JSON, mTLS")
+Rel(trip_worker, pricing_api, "котировка и snapshot; signing-keys (JWKS)", "HTTPS/JSON, mTLS")
+Rel(trip_worker, geo_api, "geo-checks start/finish; чтение checkId (разбор)", "HTTPS/JSON, mTLS")
+Rel(trip_worker, billing_api, "авторизация, опрос статуса, отмена", "HTTPS/JSON, mTLS")
+Rel(trip_worker, photo_api, "статус фото (сверка)", "HTTPS/JSON, mTLS")
+
+' --- Расчёты
+Rel(billing_settlement, pricing_api, "price-calculations; signing-keys (JWKS)", "HTTPS/JSON, mTLS")
+Rel(billing_api, psp, "Авторизация (синхронно)", "HTTPS")
+Rel(billing_settlement, psp, "Списание, возврат", "HTTPS")
+Rel(billing_recon, psp, "Сверка статусов и реестров", "HTTPS")
+Rel(billing_recon, trip_api, "статус поездки (сиротские hold)", "HTTPS/JSON, mTLS")
+Rel(billing_api, geo_api, "violation-evidence", "HTTPS/JSON, mTLS")
+Rel(billing_api, photo_api, "фото обжалования", "HTTPS/JSON, mTLS")
+
+' --- Устройства
+BiRel(fleet_cmd_worker, mqtt, "commands → / ← command-results, state", "MQTT QoS1")
+BiRel(scooter, mqtt, "telemetry, results → / ← commands", "MQTT QoS1, mTLS")
+Rel(mqtt, telemetry_ingestor, "devices/+/telemetry ($share)", "MQTT QoS1")
+
+' --- Подписанные измерения и перестроение проекций
+Rel(geo_api, telemetry_api, "signing-keys (JWKS, кеш)", "HTTPS/JSON, mTLS")
+Rel(discovery_projector, fleet_api, "scooters/snapshot", "HTTPS/JSON, mTLS")
+Rel(discovery_projector, telemetry_api, "locations/snapshot", "HTTPS/JSON, mTLS")
+Rel(discovery_projector, geo_api, "geofence-versions/current, /{versionId}", "HTTPS/JSON, mTLS")
+Rel(discovery_projector, pricing_api, "tariff-versions/current", "HTTPS/JSON, mTLS")
+Rel(fleet_api, telemetry_api, "последнее измерение", "HTTPS/JSON, mTLS")
+Rel(telemetry_api, fleet_api, "cityId самоката (кеш)", "HTTPS/JSON, mTLS")
+Rel(fleet_api, photo_api, "фото повреждений", "HTTPS/JSON, mTLS")
+
+' --- Фото и OTP
+Rel(photo_api, s3, "HEAD объекта; presign", "S3 API")
+Rel(photo_worker, s3, "оригинал → превью; удаление", "S3 API")
+Rel(user_api, sms, "Отправка OTP", "HTTPS")
+
+Lay_D(billing_recon, psp)
+Lay_D(user_api, sms)
+
+note as N1
+  Не показано: Kafka («Доменные события») и БД сервисов.
+  Событийные потоки — **c4-events**, владение данными — **c4-data**.
+  Вызовы /internal/v1 идут мимо Gateway (mTLS, allowlist вызывающих).
+  Fleet API и Fleet Command Worker связаны через Fleet DB (очередь команд).
+end note
 
 SHOW_LEGEND()
 @enduml

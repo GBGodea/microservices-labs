@@ -1,0 +1,62 @@
+@startuml c3-discovery-projector
+!pragma layout smetana
+!include <C4/C4_Component>
+title C4 — C3: Discovery Projector (Discovery Service)
+LAYOUT_LEFT_RIGHT()
+
+ContainerQueue(kafka, "Доменные события", "Apache Kafka", "availability, location, tariff, geofence; DLQ")
+
+Container_Boundary(projector, "Discovery Projector") {
+  Component(loc_consumer, "LocationConsumer", "Spring Kafka, batch listener", "telemetry.location.v1; пакет по партиции, pipeline")
+  Component(avail_consumer, "AvailabilityConsumer", "Spring Kafka", "fleet.scooter-availability.v1")
+  Component(ref_consumer, "ReferenceDataConsumer", "Spring Kafka", "pricing.tariff-version.v1, geofence.version.v1")
+  Component(dlq, "DeadLetterPublisher", "Kafka producer", "<topic>.dlq.discovery-projector")
+  Component(rebuild, "RebuildCoordinator", "Kotlin, Redis Stream consumer", "Поколение n+1, загрузка snapshot, атомарное переключение")
+  Component(sweeper, "FreshnessSweeper", "Spring Scheduler, 1 с", "Убирает из GEO положения старше 15 с")
+  Component(activator, "VersionActivator", "Spring Scheduler, 1 с", "Тарифы upcoming -> current по effectiveFrom (promote_tariff); zones-next -> zones")
+  Component(zone_geom, "ZoneGeometryService", "JTS simplify", "Упрощение до ~10 м, проверка checksum")
+  Component(fleet_client, "FleetSnapshotClient", "WebClient, Resilience4j", "Постранично, тайм-аут 2 с, retry")
+  Component(tele_client, "TelemetrySnapshotClient", "WebClient, Resilience4j", "Постранично, тайм-аут 2 с, retry")
+  Component(pricing_client, "PricingClient", "WebClient, Resilience4j", "Текущая + следующая версии тарифов города; не чаще 1 раза в 10 с на город")
+  Component(geo_client, "GeofenceClient", "WebClient, Resilience4j", "current: 500 мс, 2 повтора; {versionId}: 5 с, ETag; circuit breaker")
+  Component(writer, "ProjectionWriter", "Lettuce, Redis Functions (Lua)", "apply_location / apply_availability / apply_tariff с проверкой версии; dual-write")
+  Component(city_map, "ScooterCityResolver", "Caffeine + Redis", "scooterId -> cityId")
+}
+
+ContainerDb(discovery_index, "Discovery Index", "Redis Cluster", "dsc:{cityId}:g{n}:*, dsc:rebuild-requests")
+Container(fleet_api, "Fleet API", "Kotlin, Spring Boot", "")
+Container(telemetry_api, "Telemetry API", "Kotlin, Spring Boot", "")
+Container(pricing_api, "Pricing API", "Kotlin, Spring Boot", "")
+Container(geo_api, "Geofence API", "Kotlin, Spring Boot, JTS", "")
+
+Rel(kafka, loc_consumer, "LocationObserved", "Kafka: telemetry.location.v1")
+Rel(kafka, avail_consumer, "ScooterAvailabilityChanged", "Kafka: fleet.scooter-availability.v1")
+Rel(kafka, ref_consumer, "Tariff- / GeofenceVersionPublished", "Kafka")
+Rel(loc_consumer, writer, "apply_location")
+Rel(avail_consumer, writer, "apply_availability")
+Rel(ref_consumer, writer, "Тариф, сводка зон")
+Rel(ref_consumer, zone_geom, "versionId")
+Rel(loc_consumer, dlq, "Ядовитые сообщения")
+Rel(dlq, kafka, "DLQ", "Kafka")
+Rel(zone_geom, geo_client, "Геометрия версии")
+Rel(zone_geom, writer, "Упрощённые зоны")
+Rel(rebuild, fleet_client, "Самокаты города")
+Rel(rebuild, tele_client, "Положения")
+Rel(rebuild, pricing_client, "Тарифы")
+Rel(rebuild, zone_geom, "Текущие зоны")
+Rel(rebuild, writer, "Заливка g{n+1}, SET gen")
+Rel(sweeper, writer, "Чистка устаревших")
+Rel(activator, writer, "promote_tariff, RENAME zones-next")
+Rel(activator, pricing_client, "Сверка после активации версии")
+Rel(ref_consumer, pricing_client, "Досинхронизация после compaction / сброса offset")
+Rel(writer, city_map, "cityId самоката")
+Rel(writer, discovery_index, "FCALL, pipeline", "RESP3, TLS")
+Rel(city_map, discovery_index, "dsc:sc2city", "RESP3, TLS")
+Rel(rebuild, discovery_index, "Запросы и статус", "RESP3, TLS")
+Rel(fleet_client, fleet_api, "/internal/v1/scooters/snapshot", "HTTPS/JSON, mTLS")
+Rel(tele_client, telemetry_api, "/internal/v1/locations/snapshot", "HTTPS/JSON, mTLS")
+Rel(pricing_client, pricing_api, "/internal/v1/tariff-versions/current", "HTTPS/JSON, mTLS")
+Rel(geo_client, geo_api, "GET /internal/v1/geofence-versions/current, /{versionId}", "HTTPS/JSON, mTLS")
+
+SHOW_LEGEND()
+@enduml

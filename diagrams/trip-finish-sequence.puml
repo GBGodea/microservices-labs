@@ -1,0 +1,146 @@
+@startuml trip-finish-sequence
+!pragma layout smetana
+title Завершение поездки с фото парковки — durable saga по контейнерам
+hide footbox
+skinparam shadowing false
+skinparam defaultFontName SansSerif
+skinparam defaultFontSize 12
+skinparam maxMessageSize 250
+skinparam BoxPadding 6
+autonumber
+
+actor "Пользователь /\nприложение" as client
+participant "API Gateway" as gw
+box "Photo Service" #FBF3EA
+  participant "Photo API" as papi
+  database "Photo Object\nStorage" as s3
+  participant "Photo Processing\nWorker" as pw
+end box
+box "Trip Service" #EEF4FB
+  participant "Trip API" as tapi
+  database "Trip DB" as tdb
+  participant "Trip Saga\nWorker" as tw
+end box
+participant "Geofence API" as geo
+box "Fleet Service" #F2F8EE
+  participant "Fleet API" as fleet
+  participant "Fleet Command\nWorker" as fcw
+end box
+queue "MQTT Broker" as mqtt
+participant "Бортовая\nсистема" as device
+participant "Outbox CDC" as cdc
+queue "Kafka" as kafka
+participant "Billing Settlement\nWorker" as bsw
+
+== Фото парковки: загрузка напрямую в объектное хранилище ==
+client -> gw : POST /api/v1/photos/upload-sessions\n{purpose: TRIP_PARKING, subjectType: TRIP,\nsubjectId: tripId, contentType, sizeBytes, sha256Base64}
+gw -> papi : проксирует
+papi --> client : 201 {photoId, upload {PUT, url, headers, expiresAt: +10 мин}}
+client -> s3 : PUT presigned URL (Content-Type,\nContent-Length, x-amz-checksum-sha256)
+s3 --> client : 200
+client -> gw : POST /api/v1/photos/{photoId}/complete
+gw -> papi : проксирует
+papi -> s3 : HEAD объекта
+papi --> client : 202 {photoId, status: UPLOADED}
+
+== Команда завершения: Trip не ждёт проверки фото ==
+client -> gw : POST /api/v1/trips/{tripId}/finish\n{parkingPhotoId} + Idempotency-Key
+gw -> tapi : проксирует
+tapi -> tdb : BEGIN; trip ACTIVE→ENDING (WHERE version = ?),\nfinish_requested_at; trip_operation FINISH (ACCEPTED);\ntrip_parking_photo (link, PENDING); saga_step\nLOAD_FINISH_MEASUREMENT; idempotency_record; COMMIT
+tapi --> client : 202 {operationId, status: ACCEPTED}
+note right of tapi
+  Без parkingPhotoId и photoSkipReason → 422 PHOTO_REQUIRED.
+  photoSkipReason → поездка ставится в trip_review.
+  Поездка не ACTIVE → 409 TRIP_NOT_ACTIVE.
+end note
+
+par Проверка фото (асинхронно, независимо от завершения)
+  pw -> s3 : GET оригинала; размер, SHA-256, формат,\n≥ 640×480; превью WebP без EXIF
+  pw -> kafka : PhotoValidated {photoId, ownerUserId,\nsubjectId, flags[]} (outbox → Outbox CDC)
+  kafka -> tw : photo.status.v1
+  tw -> tdb : ownerUserId == trip.userId и subjectId == tripId?\nда → статус VALIDATED + flags; нет → OWNERSHIP_MISMATCH\n+ trip_review; после ENDED → trip_review (поздний статус)
+else Saga завершения
+  tw -> tdb : захват шага (SKIP LOCKED); операция CHECKING_PARKING
+  tw -> fleet : GET /internal/v1/scooters/{scooterId}
+  fleet --> tw : подписанное measurement (свежесть ≤ 60 с)
+  tw -> geo : POST /internal/v1/geo-checks/finish\n{tripId, finishOperationId, measurement}
+  geo --> tw : {checkId, decision, reasonCode,\npolicyVersion (int), violationEvidenceId|null}
+
+  alt decision = NEED_REMEASURE (точность > 25 м или измерение старше 60 с)
+    tw -> tdb : через 5 с снова LOAD_FINISH_MEASUREMENT (до 3 проверок)
+    note over tw,fleet
+      После 3 неудач: операция REJECTED (LOCATION_INACCURATE),
+      поездка снова ACTIVE; время первой попытки сохраняется
+      (first_finish_requested_at) — сбой GPS не вина пользователя.
+    end note
+  else decision = FORBIDDEN (запрещённая зона)
+    tw -> tdb : операция REJECTED (PARKING_FORBIDDEN, reasonCode), поездка ACTIVE,\nfinish_requested_at и first_finish_requested_at сброшены
+    note over tw,fleet
+      Клиент увидит в GET operations: REJECTED + reasonCode
+      («переставьте самокат»); поездка продолжается.
+    end note
+  else ALLOWED / ALLOWED_WITH_VIOLATION
+    tw -> tdb : finish_check {checkId, decision, reasonCode,\npolicyVersion, violationEvidenceId} сохранён; операция LOCKING;\nsaga_step SEND_LOCK(commandId: UUIDv7,\nпоследний байт = последнему байту leaseId)
+    tw -> fleet : POST /internal/v1/leases/{leaseId}/commands\n{commandId, type: LOCK, fencingToken, expiresAt: +15 с}
+    fleet --> tw : 202 {commandId, status: ACCEPTED}
+    fleet -> fcw : команда в очереди Fleet DB
+    fcw -> mqtt : PUBLISH devices/{id}/commands QoS 1
+    mqtt -> device : LOCK
+
+    alt LOCK подтверждён
+      device -> mqtt : command-results {commandId, lockState: CLOSED, deviceTime}
+      mqtt -> fcw : результат
+      fcw -> kafka : DeviceCommandUpdated EXECUTED (outbox → CDC)
+      kafka -> tw : fleet.device-command.v1\n(fallback через 3 с: GET /internal/v1/commands/{id}?leaseId={leaseId})
+      tw -> tdb : BEGIN; trip ENDED, endedAt = deviceTime;\nоперация COMPLETED; DELETE user_active_trip;\noutbox_event TripEnded (parkingPhoto = текущий статус:\nVALIDATED | PENDING | REJECTED | MISSING; finishCheck);\nsaga_step RELEASE_LEASE (+ RECONCILE_PHOTO через 30 мин,\nесли фото PENDING); COMMIT
+      tw -> fleet : POST /internal/v1/leases/{leaseId}/release\nIdempotency-Key: {tripId}:release\n{tripId, fencingToken, reason: TRIP_ENDED}
+      fleet --> tw : 200 {phase: RELEASED}
+      cdc -> tdb : читает outbox_event из WAL
+      cdc -> kafka : TripEnded → trip.lifecycle.v1 (key tripId)
+      kafka -> bsw : TripEnded → расчёт через Pricing, списание
+      note right of bsw
+        finishCheck = копия ответа Geofence; FinePolicy — по (cityId, reasonCode).
+        При force-finish (SUPPORT_FORCE_FINISH) без геопроверки:
+        decision = NOT_CHECKED, остальные поля null; автоштрафа нет.
+      end note
+    else LOCK не подтверждён (тайм-аут / UNKNOWN / FAILED)
+      tw -> tdb : операция RECONCILING, поездка RECONCILING;\nuser_active_trip и lease сохраняются
+      tw -> fleet : POST .../commands {type: QUERY_STATE}
+      fleet -> fcw : QUERY_STATE
+      fcw -> mqtt : devices/{id}/commands
+      mqtt -> device : QUERY_STATE
+      device -> mqtt : devices/{id}/state {lockState}
+      mqtt -> fcw : состояние
+      fcw -> kafka : DeviceCommandUpdated (QUERY_STATE)
+      kafka -> tw : результат сверки
+      note over tw,device
+        QUERY_STATE каждые 30 с, до 10 мин.
+        CLOSED → ENDED (как выше), endedAt = время подтверждения.
+        OPEN → один повтор LOCK, затем trip_review.
+        Нет связи 10 мин → trip_review; оператор: reconciliation-decisions
+        (LOCK_CONFIRMED / END_WITHOUT_LOCK_CONFIRMATION).
+        Начисление ограничено finishRequestedAt; самокат не выдаётся до сверки.
+      end note
+      opt END_WITHOUT_LOCK_CONFIRMATION: ENDED, endedAt = finishRequestedAt
+        tw -> fleet : POST /internal/v1/leases/{leaseId}/release\nIdempotency-Key: {tripId}:release\n{tripId, fencingToken, reason: TRIP_ENDED}
+        fleet --> tw : 409 LOCK_NOT_CONFIRMED {reconcileCommandId}\n(lease QUARANTINED, Fleet сам ставит QUERY_STATE)
+        tw -> tdb : trip_review LOCK_UNCONFIRMED; RELEASE_LEASE ждёт\nDeviceCommandUpdated по reconcileCommandId, повтор до 24 ч
+        note over tw,fleet
+          Lease освобождается, только если QUERY_STATE подтвердит CLOSED,
+          или после force-release оператором (ADMIN):
+          повторный release → 200, releaseReason = FORCE_RELEASED.
+        end note
+      end
+    end
+  end
+end
+
+== Сверка фото (RECONCILE_PHOTO), если на ENDED статус фото PENDING ==
+tw -> papi : GET /internal/v1/photos/{photoId} (тайм-аут 300 мс;\ntrip-saga-worker в allowlist)
+papi --> tw : {status, ownerUserId, subjectId, flags[], rejectReason}
+tw -> tdb : VALIDATED / REJECTED → как поздний статус (trip_review);\nUPLOADED / PROCESSING → повтор через 30 мин, 24 ч → PHOTO_NOT_PROCESSED;\n404 / EXPIRED / DELETED → PHOTO_MISSING
+
+client -> gw : GET /api/v1/trips/{tripId}/operations/{operationId}
+gw -> tapi : проксирует
+tapi --> client : {status: COMPLETED | REJECTED | RECONCILING, ...}
+@enduml

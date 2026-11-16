@@ -1,0 +1,40 @@
+@startuml c2-discovery
+!pragma layout smetana
+!include <C4/C4_Container>
+title C4 — C2: Discovery Service — контейнеры
+LAYOUT_TOP_DOWN()
+
+Person(rider, "Пользователь", "Ищет самокат на карте")
+Person(operator, "Оператор", "Запускает пересборку индекса")
+
+System_Boundary(platform, "Платформа аренды самокатов") {
+  Container(app, "Мобильное приложение", "iOS / Android", "Карта, поиск, карточка самоката")
+  Container(gateway, "API Gateway", "HTTPS reverse proxy", "JWT, квоты; маршруты /api/v1/scooters/nearby, /card, /api/v1/map")
+
+  Boundary(discovery_svc, "Discovery Service", $type="service") {
+    Container(discovery_api, "Discovery API", "Kotlin, Spring WebFlux", "nearby, карточка, карта зон; локальный кеш ответов")
+    ContainerDb(discovery_index, "Discovery Index", "Redis Cluster 7.4, 3 шарда x (primary + реплика)", "GEO доступных, карточки, тарифы, упрощённые зоны; ключи {cityId}")
+    Container(discovery_projector, "Discovery Projector", "Kotlin, Spring Kafka", "Проекция событий в индекс; пересборка поколением")
+  }
+
+  ContainerQueue(kafka, "Доменные события", "Apache Kafka + Schema Registry", "availability, location, tariff, geofence")
+  Container(fleet_api, "Fleet API", "Kotlin, Spring Boot", "Snapshot самокатов")
+  Container(telemetry_api, "Telemetry API", "Kotlin, Spring Boot", "Snapshot положений")
+  Container(pricing_api, "Pricing API", "Kotlin, Spring Boot", "Текущие тарифы города")
+  Container(geo_api, "Geofence API", "Kotlin, Spring Boot, JTS", "Геометрия версии зон")
+}
+
+Rel(rider, app, "Ищет самокат")
+Rel(app, gateway, "Поиск, карточка, зоны", "HTTPS/JSON")
+Rel(operator, gateway, "Пересборка индекса", "HTTPS/JSON")
+Rel(gateway, discovery_api, "Поиск, карточка, зоны; пересборка", "HTTPS/JSON")
+Rel(discovery_api, discovery_index, "GEOSEARCH, HMGET с реплик; XADD запроса", "RESP3, TLS")
+Rel(discovery_projector, discovery_index, "Lua-функции с проверкой версии; смена поколения", "RESP3, TLS")
+Rel(kafka, discovery_projector, "4 топика", "Kafka: fleet.scooter-availability.v1, telemetry.location.v1, pricing.tariff-version.v1, geofence.version.v1")
+Rel(discovery_projector, fleet_api, "Snapshot самокатов", "HTTPS/JSON, mTLS")
+Rel(discovery_projector, telemetry_api, "Snapshot положений", "HTTPS/JSON, mTLS")
+Rel(discovery_projector, pricing_api, "Текущие тарифы", "HTTPS/JSON, mTLS")
+Rel(discovery_projector, geo_api, "Версия зон: geofence-versions/current, /{versionId}", "HTTPS/JSON, mTLS")
+
+SHOW_LEGEND()
+@enduml

@@ -1,0 +1,62 @@
+@startuml c3-billing-api
+!pragma layout smetana
+!include <C4/C4_Component>
+title C4 — C3: Billing API (Billing Service)
+LAYOUT_TOP_DOWN()
+
+Container(gateway, "API Gateway", "HTTPS reverse proxy", "JWT пользователя/оператора; webhook PSP")
+Container(trip_worker, "Trip Saga Worker", "Kotlin, Spring Boot", "Шаг saga старта")
+System_Ext(psp, "Платёжный провайдер (PSP)", "Авторизация, void, привязка карты, списание")
+Container(photo_api, "Photo API", "Kotlin, Spring Boot", "Метаданные фото")
+Container(geofence_api, "Geofence API", "Kotlin, Spring Boot", "Свидетельство нарушения (violation-evidence)")
+ContainerDb(billing_db, "Billing DB", "PostgreSQL 17 (через PgBouncer)", "Авторизации, операции, платежи, штрафы, проводки, outbox, inbox webhook")
+
+Container_Boundary(api, "Billing API") {
+  Component(auth_ctrl, "PaymentAuthorizationController", "Spring MVC, mTLS allowlist", "/internal/v1/payment-authorizations: создать, отменить, прочитать")
+  Component(public_ctrl, "Public REST Controllers", "Spring MVC, JWT", "payment-methods, payments, fines, appeals, debts")
+  Component(admin_ctrl, "Admin Controllers", "Spring MVC, RBAC", "Возвраты, ручной штраф POST /admin/v1/fines (source = MANUAL), решения по обжалованиям, версии FinePolicy")
+  Component(webhook_ctrl, "PspWebhookController", "Spring MVC", "Проверка HMAC и окна времени, INSERT в psp_webhook_inbox, быстрый 200")
+  Component(idem, "Idempotency Guard", "Servlet filter + SQL", "idempotency_record: повтор → сохранённый ответ, другое тело → 422")
+  Component(auth_svc, "AuthorizationService", "Kotlin", "Автомат авторизации; операция фиксируется ДО вызова PSP; тайм-аут → PENDING_RECONCILIATION")
+  Component(method_svc, "PaymentMethodService", "Kotlin", "Сессия привязки у PSP, токены, карта по умолчанию")
+  Component(pay_svc, "PaymentCommandService", "Kotlin", "Погашение долга (CHARGE), заявки на возврат, история платежей")
+  Component(fine_svc, "FineAppealService", "Kotlin", "Обжалования, решения, ручные штрафы (MANUAL, политика по (cityId, reasonCode) на endedAt), версии FinePolicy")
+  Component(psp_client, "PSP Client (ACL)", "Kotlin, Resilience4j", "Пул API: тайм-аут 3 с, bulkhead 64, rate limiter, circuit breaker; коды PSP → внутренние")
+  Component(photo_client, "Photo API Client", "WebClient, Resilience4j", "Владелец, purpose, subject, status = VALIDATED, иначе 422 PHOTO_NOT_ACCEPTABLE; тайм-аут 300 мс, 2 повтора, CB")
+  Component(geo_client, "Geofence API Client", "WebClient, Resilience4j", "Свидетельство нарушения для разбора; тайм-аут 1 с, 1 повтор, CB; подачу обжалования не блокирует")
+  Component(ledger, "Ledger & Outbox Writer", "Kotlin, JDBC", "Проводки double-entry + outbox_event в той же транзакции")
+  Component(repos, "Repositories", "Spring JDBC", "authorization, payment_operation, payment, fine, payment_method, user_billing_account")
+}
+
+Rel(trip_worker, auth_ctrl, "Авторизация / отмена hold / статус", "HTTPS/JSON, mTLS")
+Rel(gateway, public_ctrl, "/api/v1/...", "HTTPS/JSON")
+Rel(gateway, admin_ctrl, "/admin/v1/...", "HTTPS/JSON")
+Rel(gateway, webhook_ctrl, "/webhooks/v1/psp/{provider}", "HTTPS")
+
+Rel(auth_ctrl, auth_svc, "Команды авторизации")
+Rel(public_ctrl, idem, "Запросы; POST — по Idempotency-Key")
+Rel(admin_ctrl, idem, "Запросы; POST — по Idempotency-Key")
+Rel(idem, method_svc, "Привязка, удаление карты")
+Rel(idem, pay_svc, "Погашение долга, возврат")
+Rel(idem, fine_svc, "Обжалование, решение, ручной штраф")
+
+Rel(auth_svc, psp_client, "authorize / void")
+Rel(method_svc, psp_client, "Сессия привязки карты")
+Rel(pay_svc, psp_client, "charge долга")
+Rel(fine_svc, photo_client, "Проверить photoIds")
+Rel(photo_client, photo_api, "GET /internal/v1/photos/{photoId}", "HTTPS/JSON, mTLS")
+Rel(fine_svc, geo_client, "Свидетельство по violationEvidenceId")
+Rel(geo_client, geofence_api, "GET /internal/v1/violation-evidence/{evidenceId}", "HTTPS/JSON, mTLS")
+Rel(psp_client, psp, "Вызовы с Idempotence-Key", "HTTPS/JSON")
+
+Rel(auth_svc, ledger, "Переходы + события")
+Rel(pay_svc, ledger, "Проводки + PaymentStatusChanged")
+Rel(fine_svc, ledger, "Проводки + FineIssued (MANUAL) / FineStatusChanged")
+Rel(ledger, repos, "INSERT в транзакции")
+Rel(webhook_ctrl, repos, "INSERT ... ON CONFLICT DO NOTHING")
+Rel(method_svc, repos, "payment_method")
+Rel(repos, billing_db, "Чтение/запись", "SQL")
+Rel(idem, billing_db, "idempotency_record", "SQL")
+
+SHOW_LEGEND()
+@enduml

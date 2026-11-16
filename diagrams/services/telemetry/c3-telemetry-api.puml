@@ -1,0 +1,53 @@
+@startuml c3-telemetry-api
+!pragma layout smetana
+!include <C4/C4_Component>
+title C4 — C3: Telemetry API (Telemetry Service)
+LAYOUT_TOP_DOWN()
+
+Container(gateway, "API Gateway", "HTTPS reverse proxy", "JWT оператора, квоты")
+Container(fleet_api, "Fleet API", "Kotlin, Spring Boot", "Резервное чтение положения; cityId самоката")
+Container(discovery_projector, "Discovery Projector", "Kotlin, Spring Kafka", "Пересборка геоиндекса")
+Container(geo_api, "Geofence API", "Kotlin, Spring Boot, JTS", "Проверка подписи измерения")
+
+Container_Boundary(api, "Telemetry API") {
+  Component(svc_filter, "ServiceIdentityFilter", "Spring Security, mTLS", "SAN сертификата -> service identity; allowlist на эндпоинт")
+  Component(op_auth, "OperatorAuthorization", "Spring Security, JWT", "Роли OPERATOR / SUPPORT / ADMIN; лимит 60 запросов/ч")
+  Component(location_ctrl, "LocationController", "Spring MVC", "GET /internal/v1/scooters/{scooterId}/location")
+  Component(snapshot_ctrl, "LocationSnapshotController", "Spring MVC", "GET /internal/v1/locations/snapshot; keyset-курсор")
+  Component(keys_ctrl, "SigningKeysController", "Spring MVC", "GET /internal/v1/signing-keys; JWKS, ETag")
+  Component(history_ctrl, "LocationHistoryAdminController", "Spring MVC", "GET /admin/v1/telemetry/scooters/{scooterId}/locations")
+  Component(history_svc, "LocationHistoryService", "Kotlin", "Окно <= 24 ч; raw или 1m по сроку хранения; курсор")
+  Component(audit_svc, "AccessAuditService", "Kotlin", "Fail-closed: нет записи аудита - нет данных")
+  Component(last_repo, "LastLocationRepository", "JDBC, primary", "scooter_last_location (UNLOGGED) по PK")
+  Component(history_repo, "MeasurementHistoryRepository", "JDBC, read replica", "telemetry_measurement, telemetry_minute")
+  Component(key_cache, "SigningKeyCache", "Caffeine + JDBC", "signing_key; обновление раз в 60 с")
+  Component(audit_repo, "AccessAuditRepository", "JDBC", "location_access_audit, запись на primary")
+  Component(city_client, "ScooterCityClient", "WebClient, Resilience4j", "cityId самоката для проверки cityIds оператора; кеш 10 мин; fail-closed")
+}
+
+ContainerDb(telemetry_db, "Telemetry DB", "PostgreSQL + TimescaleDB", "Primary + асинхронная реплика")
+
+Rel(fleet_api, svc_filter, "Последнее измерение", "HTTPS/JSON, mTLS")
+Rel(discovery_projector, svc_filter, "Snapshot положений", "HTTPS/JSON, mTLS")
+Rel(geo_api, svc_filter, "JWKS", "HTTPS/JSON, mTLS")
+Rel(gateway, op_auth, "История перемещений", "HTTPS/JSON, JWT")
+Rel(svc_filter, location_ctrl, "fleet-api")
+Rel(svc_filter, snapshot_ctrl, "discovery-projector")
+Rel(svc_filter, keys_ctrl, "geofence-api")
+Rel(op_auth, history_ctrl, "Оператор с ролью")
+Rel(location_ctrl, last_repo, "Чтение по scooterId")
+Rel(snapshot_ctrl, last_repo, "Keyset-страница")
+Rel(keys_ctrl, key_cache, "Активные и следующие ключи")
+Rel(history_ctrl, history_svc, "Запрос истории")
+Rel(history_svc, audit_svc, "Сначала аудит")
+Rel(history_svc, history_repo, "Точки за окно")
+Rel(audit_svc, audit_repo, "INSERT записи доступа")
+Rel(last_repo, telemetry_db, "SELECT", "SQL")
+Rel(history_repo, telemetry_db, "SELECT с реплики", "SQL")
+Rel(key_cache, telemetry_db, "SELECT signing_key", "SQL")
+Rel(audit_repo, telemetry_db, "INSERT", "SQL")
+Rel(history_svc, city_client, "Город самоката")
+Rel(city_client, fleet_api, "GET /internal/v1/scooters/{scooterId}", "HTTPS/JSON, mTLS")
+
+SHOW_LEGEND()
+@enduml

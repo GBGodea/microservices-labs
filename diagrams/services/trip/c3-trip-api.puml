@@ -1,0 +1,58 @@
+@startuml c3-trip-api
+!pragma layout smetana
+!include <C4/C4_Component>
+title C4 — C3: Trip API (Trip Service)
+LAYOUT_TOP_DOWN()
+
+Container(gateway, "API Gateway", "HTTPS reverse proxy", "JWT пользователя/оператора, квоты")
+Container(user_api, "User API", "Kotlin, Spring Boot", "/.well-known/jwks.json")
+Container(billing_recon, "Billing Reconciliation Worker", "Kotlin, Spring Boot", "Сверка осиротевших hold")
+
+Container_Boundary(trip_api, "Trip API") {
+  Component(sec, "Security Filter", "Spring Security, Nimbus JOSE", "Проверка JWT по кешу JWKS, роли, владелец поездки = sub; для /internal — mTLS (SPIFFE) и allowlist, иначе 403 CALLER_NOT_ALLOWED")
+  Component(cmd_ctrl, "Trip Command Controller", "Spring MVC", "POST /api/v1/trips, POST /api/v1/trips/{id}/finish")
+  Component(query_ctrl, "Trip Query Controller", "Spring MVC", "GET поездки, списка, операции; ETag/304")
+  Component(admin_ctrl, "Admin Controller", "Spring MVC", "/admin/v1/trips/~*~*, /admin/v1/trip-reviews/~*~*")
+  Component(internal_ctrl, "Internal Query Controller", "Spring MVC", "GET /internal/v1/trips/{tripId}: узкая проекция статуса для сверки hold")
+  Component(idem, "Idempotency Guard", "Kotlin", "scope + Idempotency-Key + hash тела; повтор = сохранённый ответ")
+  Component(start_h, "Start Trip Handler", "Kotlin, @Transactional", "trip PREPARING + user_active_trip + START-операция + первый saga_step")
+  Component(finish_h, "Finish Trip Handler", "Kotlin, @Transactional", "ACTIVE→ENDING по версии, FINISH-операция, привязка фото, saga_step")
+  Component(admin_h, "Admin Command Handler", "Kotlin, @Transactional", "force-finish, решения сверки и разбора, повтор шага")
+  Component(domain, "Trip State Machine & Policies", "Kotlin, domain", "Допустимые переходы, PhotoPolicy, правила ошибок")
+  Component(write_repo, "Trip Write Repository", "Spring JDBC", "INSERT/UPDATE с проверкой version, ON CONFLICT")
+  Component(read_repo, "Trip Read Repository", "Spring JDBC", "Точечные чтения — primary; история и поиск — реплика")
+}
+
+ContainerDb(trip_db, "Trip DB", "PostgreSQL primary", "trip, user_active_trip, trip_operation, saga_step, idempotency_record")
+ContainerDb(trip_db_ro, "Trip DB (read replica)", "PostgreSQL async replica", "История пользователя, admin-поиск")
+Container(trip_worker, "Trip Saga Worker", "Kotlin, Spring Boot", "Исполняет saga_step")
+
+Rel(gateway, sec, "Запросы /api/v1/trips/~*~*, /admin/v1/trips/~*~*, /admin/v1/trip-reviews/~*~*", "HTTPS/JSON")
+Rel(billing_recon, sec, "GET /internal/v1/trips/{tripId}", "HTTPS/JSON, mTLS")
+Rel(sec, user_api, "Обновление JWKS (кеш 5 мин; неизвестный kid — сразу, не чаще раза в 30 с)", "HTTPS")
+Rel(sec, cmd_ctrl, "Аутентифицированные команды")
+Rel(sec, query_ctrl, "Аутентифицированные чтения")
+Rel(sec, admin_ctrl, "Роли OPERATOR / SUPPORT / ADMIN")
+Rel(sec, internal_ctrl, "mTLS-идентичность в allowlist")
+Rel(cmd_ctrl, idem, "Проверяет ключ")
+Rel(admin_ctrl, idem, "Проверяет ключ")
+Rel(cmd_ctrl, start_h, "StartTrip")
+Rel(cmd_ctrl, finish_h, "FinishTrip")
+Rel(admin_ctrl, admin_h, "Команды оператора")
+Rel(start_h, domain, "Создаёт агрегат")
+Rel(finish_h, domain, "Проверяет переход")
+Rel(admin_h, domain, "Проверяет переход")
+Rel(start_h, write_repo, "Одна транзакция")
+Rel(finish_h, write_repo, "Одна транзакция")
+Rel(admin_h, write_repo, "Одна транзакция + If-Match")
+Rel(idem, write_repo, "idempotency_record в той же транзакции")
+Rel(query_ctrl, read_repo, "Чтения")
+Rel(admin_ctrl, read_repo, "Поиск, карточка, очередь разбора")
+Rel(internal_ctrl, read_repo, "Поездка по PK (primary)")
+Rel(write_repo, trip_db, "INSERT/UPDATE", "SQL, PgBouncer")
+Rel(read_repo, trip_db, "Поездка/операция по PK", "SQL")
+Rel(read_repo, trip_db_ro, "История, поиск", "SQL")
+Rel(trip_worker, trip_db, "Забирает шаги (SKIP LOCKED)", "SQL")
+
+SHOW_LEGEND()
+@enduml

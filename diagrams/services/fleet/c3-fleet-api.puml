@@ -1,0 +1,75 @@
+@startuml c3-fleet-api
+!pragma layout smetana
+!include <C4/C4_Component>
+title C4 — C3: Fleet API (Fleet Service)
+LAYOUT_TOP_DOWN()
+
+Container(gateway, "API Gateway", "HTTPS reverse proxy", "JWT пользователя/оператора")
+Container(trip_worker, "Trip Saga Worker", "Kotlin, Spring Boot", "Вызывающий internal API")
+Container(discovery_projector, "Discovery Projector", "Kotlin, Spring Kafka", "Перестроение геоиндекса")
+
+Container_Boundary(fleet_api, "Fleet API") {
+  Component(security, "Security & Idempotency Filter", "Spring Security, servlet filter", "mTLS allowlist / JWT-роли; idempotency_record; traceparent")
+  Component(internal_scooter_ctl, "Internal Scooter Controller", "Spring MVC", "GET scooters/{id}, GET scooters/snapshot")
+  Component(internal_lease_ctl, "Internal Lease & Command Controller", "Spring MVC", "POST leases, POST commands, GET commands/{id}, POST release, GET leases/{id}")
+  Component(damage_ctl, "Damage Report Controller", "Spring MVC", "POST /api/v1/scooters/{id}/damage-reports")
+  Component(admin_ctl, "Admin Controller", "Spring MVC", "/admin/v1/scooters..., /admin/v1/damage-reports..., /admin/v1/leases/{id}/force-release")
+
+  Component(query_svc, "Scooter Query Service", "Kotlin", "Состояние + последнее измерение; порог свежести, fallback в Telemetry (не для вызова от telemetry-api)")
+  Component(lease_svc, "Lease Service", "Kotlin", "Выдача PREPARING lease (fencing = ++lease_epoch), release, force-release")
+  Component(cmd_svc, "Command Intake Service", "Kotlin", "Проверка lease/token/фазы, команда + очередь + outbox, pg_notify")
+  Component(damage_svc, "Damage Report Service", "Kotlin", "Лимиты, проверка tripId по lease, сверка фото, TriagePolicy, MAINTENANCE")
+  Component(policy, "Availability Policy", "Kotlin, доменная модель", "Фаза lease + обслуживание + online + заряд -> availability")
+  Component(repos, "Repositories", "Spring JDBC", "Условные UPDATE, keyset-пагинация")
+  Component(outbox, "Outbox Writer", "Spring JDBC", "outbox_event в той же транзакции")
+  Component(telemetry_client, "Telemetry Client", "WebClient + Resilience4j", "Тайм-аут 150 мс без повтора, circuit breaker, bulkhead 50")
+  Component(photo_client, "Photo Client", "WebClient + Resilience4j", "Тайм-аут 300 мс, 2 повтора, circuit breaker, bulkhead 20; при отказе фото PENDING")
+}
+
+ContainerDb(fleet_db, "Fleet DB", "PostgreSQL", "Через PgBouncer (transaction pooling)")
+Container(telemetry_api, "Telemetry API", "Kotlin, Spring Boot", "GET /internal/v1/scooters/{id}/location; сам вызывает Fleet за cityId")
+Container(photo_api, "Photo API", "Kotlin, Spring Boot", "GET /internal/v1/photos/{photoId}")
+Container(cdc, "Outbox CDC", "Kafka Connect + Debezium", "Публикует outbox в Kafka")
+Container(cmd_worker, "Fleet Command Worker", "Kotlin, MQTT client", "Забирает очередь команд")
+
+Rel(gateway, security, "public/admin запросы", "HTTPS/JSON, JWT")
+Rel(trip_worker, security, "internal запросы", "HTTPS/JSON, mTLS")
+Rel(discovery_projector, security, "snapshot", "HTTPS/JSON, mTLS")
+Rel(telemetry_api, security, "GET scooters/{id}: cityId самоката", "HTTPS/JSON, mTLS")
+Rel(security, internal_scooter_ctl, "Передаёт", "in-process")
+Rel(security, internal_lease_ctl, "Передаёт", "in-process")
+Rel(security, damage_ctl, "Передаёт", "in-process")
+Rel(security, admin_ctl, "Передаёт", "in-process")
+
+Rel(internal_scooter_ctl, query_svc, "Читает состояние", "вызов")
+Rel(internal_lease_ctl, lease_svc, "Lease, release", "вызов")
+Rel(internal_lease_ctl, cmd_svc, "Команды", "вызов")
+Rel(damage_ctl, damage_svc, "Создаёт отчёт", "вызов")
+Rel(admin_ctl, damage_svc, "Разбор отчётов", "вызов")
+Rel(admin_ctl, lease_svc, "force-release, обслуживание", "вызов")
+Rel(admin_ctl, cmd_svc, "Сервисные команды", "вызов")
+
+Rel(lease_svc, query_svc, "Проверка свежести измерения", "вызов")
+Rel(query_svc, telemetry_client, "Измерение старше порога", "вызов")
+Rel(telemetry_client, telemetry_api, "GET location", "HTTPS/JSON, mTLS")
+Rel(lease_svc, policy, "Пересчёт availability", "вызов")
+Rel(cmd_svc, policy, "PREPARING -> ACTIVE: IN_USE", "вызов")
+Rel(damage_svc, policy, "MAINTENANCE", "вызов")
+Rel(damage_svc, photo_client, "Фото, которых нет в проекции", "вызов")
+Rel(photo_client, photo_api, "GET photos/{id}", "HTTPS/JSON, mTLS")
+
+Rel(query_svc, repos, "PK-чтения", "вызов")
+Rel(lease_svc, repos, "Условный UPDATE/INSERT", "вызов")
+Rel(cmd_svc, repos, "device_command + queue", "вызов")
+Rel(damage_svc, repos, "damage_report, photo", "вызов")
+Rel(lease_svc, outbox, "ScooterAvailabilityChanged", "вызов")
+Rel(cmd_svc, outbox, "ScooterAvailabilityChanged", "вызов")
+Rel(damage_svc, outbox, "ScooterAvailabilityChanged", "вызов")
+Rel(repos, fleet_db, "Чтение/запись", "SQL")
+Rel(outbox, fleet_db, "INSERT outbox_event", "SQL")
+Rel(security, fleet_db, "idempotency_record", "SQL")
+Rel(cdc, fleet_db, "Читает WAL outbox_event", "logical replication")
+Rel(cmd_worker, fleet_db, "LISTEN fleet_command_ready, SKIP LOCKED", "SQL")
+
+SHOW_LEGEND()
+@enduml

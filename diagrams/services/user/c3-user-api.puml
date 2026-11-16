@@ -1,0 +1,65 @@
+@startuml c3-user-api
+!pragma layout smetana
+!include <C4/C4_Component>
+title C4 — C3: User API (User Service)
+LAYOUT_TOP_DOWN()
+
+Container(gateway, "API Gateway", "HTTPS reverse proxy", "Публичные и админ-маршруты; кеширует JWKS")
+Container(trip_worker, "Trip Saga Worker", "Kotlin, Spring Boot", "Проверка права старта")
+
+Container_Boundary(user_api, "User API") {
+  Component(auth_ctl, "AuthController", "Spring MVC", "POST /api/v1/auth/otp, /token, /logout")
+  Component(profile_ctl, "ProfileController", "Spring MVC", "GET/PATCH/DELETE /api/v1/users/me, POST .../consents")
+  Component(admin_ctl, "AdminUserController", "Spring MVC, RBAC", "/admin/v1/users/**: карточка, поиск, блокировки")
+  Component(internal_ctl, "EligibilityAndJwksController", "Spring MVC, mTLS allowlist", "GET .../rental-eligibility, GET /.well-known/jwks.json")
+
+  Component(rate_limiter, "AuthRateLimiter", "Kotlin", "Лимиты OTP по телефону, устройству, IP; блокировки входа")
+  Component(otp_svc, "OtpService", "Kotlin", "Выпуск и проверка OTP: HMAC-хеш, TTL, счётчик попыток")
+  Component(token_svc, "TokenService", "Kotlin", "Сессии, ротация refresh, обнаружение повторного использования")
+  Component(key_provider, "SigningKeyProvider", "Kotlin, Nimbus JOSE", "Подпись JWT ES256 по kid; набор ключей для JWKS; обновление раз в 60 с")
+  Component(profile_svc, "ProfileAndConsentService", "Kotlin", "Профиль, согласия, заявка на удаление")
+  Component(access_policy, "AccessPolicy", "Kotlin, доменная модель", "Статус доступа, причины, eligibility, accessVersion")
+  Component(pii_crypto, "PiiCrypto", "Kotlin, AES-GCM / HMAC-SHA256", "Шифрование колонок ПДн, хеш телефона")
+  Component(sms_client, "SmsGatewayClient", "Resilience4j", "Тайм-аут 2 с, CB, bulkhead; messageId = challengeId")
+  Component(repos, "Repositories", "Spring JDBC / jOOQ", "Аккаунт, ПДн, сессии, OTP, доступ, блокировки, idempotency")
+  Component(outbox, "OutboxWriter", "Kotlin", "UserAccessChanged в outbox_event в той же транзакции")
+}
+
+ContainerDb(user_db, "User DB", "PostgreSQL", "Primary через PgBouncer")
+Container(secrets, "Секреты и ключи", "Vault / KMS", "Приватные ключи JWT, DEK, pepper")
+System_Ext(sms, "SMS-шлюз", "Доставка OTP")
+
+Rel(gateway, auth_ctl, "Вход и токены", "HTTPS/JSON")
+Rel(gateway, profile_ctl, "Профиль (JWT)", "HTTPS/JSON")
+Rel(gateway, admin_ctl, "Админ (JWT оператора)", "HTTPS/JSON")
+Rel(gateway, internal_ctl, "JWKS", "HTTPS/JSON")
+Rel(trip_worker, internal_ctl, "rental-eligibility", "HTTPS/JSON, mTLS")
+
+Rel(auth_ctl, rate_limiter, "Проверка лимитов")
+Rel(auth_ctl, otp_svc, "Выпуск/проверка кода")
+Rel(auth_ctl, token_svc, "Выдача/ротация/отзыв")
+Rel(otp_svc, sms_client, "Отправка кода")
+Rel(otp_svc, pii_crypto, "Хеш телефона")
+Rel(token_svc, key_provider, "Подписать JWT")
+Rel(profile_ctl, profile_svc, "Команды профиля")
+Rel(admin_ctl, profile_svc, "Карточка, поиск по телефону")
+Rel(admin_ctl, access_policy, "Блокировки")
+Rel(internal_ctl, access_policy, "Eligibility")
+Rel(internal_ctl, key_provider, "Публичные ключи")
+Rel(profile_svc, pii_crypto, "Шифрование/расшифровка")
+Rel(profile_svc, access_policy, "Пересчёт доступа")
+Rel(access_policy, outbox, "Событие при изменении")
+
+Rel(rate_limiter, repos, "Счётчики, auth_lock")
+Rel(otp_svc, repos, "otp_challenge")
+Rel(token_svc, repos, "user_session")
+Rel(access_policy, repos, "user_access, user_block")
+Rel(profile_svc, repos, "user_pii, user_consent")
+Rel(repos, user_db, "Чтение/запись", "SQL")
+Rel(outbox, user_db, "INSERT outbox_event", "SQL")
+Rel(sms_client, sms, "Отправить SMS", "HTTPS/JSON")
+Rel(key_provider, secrets, "Приватный ключ по kid", "HTTPS, mTLS")
+Rel(pii_crypto, secrets, "DEK и pepper (кеш 1 ч)", "HTTPS, mTLS")
+
+SHOW_LEGEND()
+@enduml

@@ -21,6 +21,7 @@ rectangle "Discovery\nПоиск\n[Discovery Service]" as search
 rectangle "Pricing\nТарификация\n[Pricing Service]" as pricing
 rectangle "Billing\nРасчёты и штрафы\n[Billing Service]" as billing
 rectangle "Geofencing\nГеополитики\n[Geofence Service]" as geo
+rectangle "Photo Evidence\nФотофиксация\n[Photo Service]\nподдерживающий поддомен" as photo
 rectangle "Платёжный провайдер\nВнешний контекст" as psp #F1F5F9
 
 rental --> users : Проверяет право старта\nOHS/PL; User U, Rental D
@@ -33,13 +34,21 @@ rental --> billing : Запрашивает/отменяет авторизац�
 rental ..> billing : TripEnded + snapshot + свидетельства\nPL/адаптер; Rental U, Billing D
 billing ..> rental : PaymentStatusChanged / FineIssued\nPL; Billing U, Rental D
 billing ..> users : Передаёт финансовый статус\nPL; Billing U, User D
+users ..> billing : UserAccessChanged (DELETED)\n→ удаление токенов PSP\nPL; User U, Billing D
+billing --> rental : Читает статус поездки\n(сверка сиротских hold)\nOHS/PL; Rental U, Billing D
+billing --> geo : Читает свидетельство нарушения\n(обжалование, ручной штраф)\nOHS/PL; Geo U, Billing D
+billing --> photo : Проверяет фото обжалования\nOHS/PL; Photo U, Billing D
 billing --> pricing : Рассчитывает цену по snapshot\nOHS/PL; Pricing U, Billing D
 billing --> psp : Авторизация, списание, возврат, сверка\nACL в Billing; PSP U, Billing D
 psp ..> billing : Подписанные webhook статусов\nACL в Billing; PSP U, Billing D
 fleet ..> search : Доступность и LocationObserved\nPL + ACL; Fleet U, Discovery D
-fleet ..> geo : LocationObserved для геопроекции\nPL; Fleet U, Geo D
+geo --> fleet : Проверяет подписанное измерение\n(Ed25519, ключи — JWKS Telemetry)\nPublished Language + JWKS; Fleet U, Geo D
 pricing ..> search : TariffVersionPublished\nPL + ACL; Pricing U, Discovery D
 geo ..> search : GeofenceVersionPublished\nPL + ACL; Geo U, Discovery D
+photo ..> rental : PhotoValidated / PhotoRejected (фото парковки);\nвладельца и поездку проверяет Trip;\nсверка статуса — GET /internal фото\nCustomer-Supplier; Photo U, Rental D
+photo ..> fleet : PhotoValidated / PhotoRejected\n(фото повреждений; сверка — GET /internal фото)\nPL; Photo U, Fleet D
+billing ..> photo : FineIssued / FineStatusChanged (photoIds)\n→ удержания; фото обжалований\nPL; Billing U, Photo D
+users ..> photo : UserAccessChanged (DELETED)\n→ удаление фото без удержаний\nPL; User U, Photo D
 
 legend bottom left
   Прямоугольник = bounded context; число сервисов внутри может различаться.
@@ -47,6 +56,6 @@ legend bottom left
   Пунктирная стрелка: производитель факта -> потребитель.
   U / D = upstream / downstream для подписанного контракта, не направление RPC.
   OHS/PL = Open Host Service / Published Language; ACL = Anti-Corruption Layer.
-  Kafka, базы данных и Gateway не являются бизнес-контекстами.
+  Kafka, базы данных, объектное хранилище и Gateway не являются бизнес-контекстами.
 endlegend
 @enduml

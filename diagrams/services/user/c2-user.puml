@@ -1,0 +1,48 @@
+@startuml c2-user
+!pragma layout smetana
+!include <C4/C4_Container>
+title C4 — C2: User Service — контейнеры
+LAYOUT_TOP_DOWN()
+
+Person(rider, "Пользователь", "Вход по телефону, профиль, согласия, удаление аккаунта")
+Person(operator, "Оператор", "Поддержка: карточка пользователя, блокировки")
+
+System_Boundary(platform, "Платформа аренды самокатов") {
+  Container(gateway, "API Gateway", "HTTPS reverse proxy", "Маршрутизация, проверка JWT по JWKS, квоты на вход по OTP")
+
+  Boundary(user_svc, "User Service", $type="service") {
+    Container(user_api, "User API", "Kotlin, Spring Boot", "OTP-вход, токены, профиль и согласия, право старта, JWKS, админ-блокировки")
+    Container(user_worker, "User Worker", "Kotlin, Spring Kafka", "Ограничения из Billing -> статус доступа; удаление/обезличивание; очистка OTP и сессий; ротация ключей JWT")
+    ContainerDb(user_db, "User DB", "PostgreSQL", "Аккаунты, ПДн (шифрованные колонки), сессии, OTP, статус доступа, проекция долгов/штрафов, outbox/inbox")
+  }
+
+  Container(trip_worker, "Trip Saga Worker", "Kotlin, Spring Boot", "Шаг saga: проверка права старта")
+  Container(other_apis, "API других сервисов", "Kotlin", "Локальная проверка JWT пользователя")
+  Container(photo_worker, "Photo Processing Worker", "Kotlin, Spring Boot", "Удаление фото удалённого пользователя")
+  Container(billing_settlement, "Billing Settlement Worker", "Kotlin, Spring Kafka", "Деактивация способов оплаты удалённого пользователя")
+  Container(outbox_cdc, "Outbox CDC", "Kafka Connect + Debezium", "Читает WAL, публикует outbox")
+  ContainerQueue(kafka, "Доменные события", "Apache Kafka + Schema Registry", "user.access.v1, billing.payment-status.v1, billing.fine.v1")
+  Container(secrets, "Секреты и ключи", "Vault / KMS", "Приватные ключи JWT, ключи шифрования ПДн, pepper для HMAC")
+}
+
+System_Ext(sms, "SMS-шлюз", "Доставка OTP-кодов")
+
+Rel(rider, gateway, "Вход, профиль", "HTTPS/JSON")
+Rel(operator, gateway, "Админ-API", "HTTPS/JSON")
+Rel(gateway, user_api, "Маршруты /api/v1/auth, /api/v1/users, /admin/v1/users; JWKS", "HTTPS/JSON")
+Rel(trip_worker, user_api, "GET /internal/v1/users/{userId}/rental-eligibility", "HTTPS/JSON, mTLS")
+Rel(other_apis, user_api, "GET /.well-known/jwks.json (кеш 5 мин)", "HTTPS/JSON, mTLS")
+Rel(user_api, sms, "Отправить OTP (тайм-аут 2 с, CB)", "HTTPS/JSON")
+Rel(user_api, user_db, "Чтение/запись + outbox в одной транзакции", "SQL")
+Rel(user_worker, user_db, "Inbox, проекции, пересчёт доступа, outbox, очистка", "SQL")
+Rel(user_api, secrets, "Ключ подписи JWT, DEK ПДн", "HTTPS, mTLS")
+Rel(user_worker, secrets, "Создание ключей JWT при ротации", "HTTPS, mTLS")
+Rel(outbox_cdc, user_db, "Читает WAL outbox_event", "logical replication")
+Rel(outbox_cdc, kafka, "UserAccessChanged", "Kafka: user.access.v1")
+Rel(kafka, user_worker, "PaymentStatusChanged, FineIssued, FineStatusChanged", "Kafka: billing.payment-status.v1, billing.fine.v1")
+Rel(kafka, trip_worker, "UserAccessChanged", "Kafka: user.access.v1")
+Rel(kafka, photo_worker, "UserAccessChanged (DELETED)", "Kafka: user.access.v1")
+Rel(kafka, billing_settlement, "UserAccessChanged (DELETED)", "Kafka: user.access.v1")
+
+SHOW_LEGEND()
+@enduml

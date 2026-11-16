@@ -1,44 +1,131 @@
 @startuml c4-data
 !pragma layout smetana
 !include <C4/C4_Container>
-title C4 — C2: владение данными (связи сервисов — на виде c4-containers)
-LAYOUT_TOP_DOWN()
+title C4 — C2: владение данными (синхронные связи — c4-containers, события — c4-events)
+LAYOUT_LEFT_RIGHT()
+
+AddRelTag("ro", $lineStyle = DashedLine(), $legendText = "только чтение")
+AddRelTag("cdc", $lineStyle = BoldLine(), $legendText = "Outbox CDC читает WAL (logical replication, слот на БД)")
 
 System_Boundary(platform, "Платформа аренды — отдельная БД и учётная запись на сервис") {
-  Container(user, "User Service", "REST API", "User Management")
-  ContainerDb(userdb, "User DB", "PostgreSQL", "User, доступ, сессии, inbox/outbox")
-  Container(fleet, "Fleet Service", "REST API + MQTT workers", "Fleet & IoT: команды и ресурс")
-  ContainerDb(fleetdb, "Fleet DB", "PostgreSQL", "Scooter, ScooterLease, DeviceCommand, inbox/outbox")
-  Container(telemetry, "Telemetry Service", "MQTT ingestion", "Fleet & IoT: измерения")
-  ContainerDb(telemetrydb, "Telemetry DB", "TimescaleDB / PostgreSQL", "Location, heartbeat, качество, outbox; отдельная ретенция")
-  Container(discovery, "Discovery Service", "REST API + consumers", "Discovery")
-  ContainerDb(searchdb, "Discovery Index", "Redis GEO + checkpoints", "Производные документы; доступность и свежесть; восстановим из snapshot + событий")
-  Container(trip, "Trip Service", "REST API + saga workers", "Rental")
-  ContainerDb(tripdb, "Trip DB", "PostgreSQL", "Trip, шаги saga, snapshots, операции, inbox/outbox")
-  Container(pricing, "Pricing Service", "REST API", "Pricing")
-  ContainerDb(pricingdb, "Pricing DB", "PostgreSQL", "Tariff, версии, правила, Quote, outbox")
-  Container(billing, "Billing Service", "REST API + workers", "Billing")
-  ContainerDb(billingdb, "Billing DB", "PostgreSQL", "Payment, Fine, FinePolicy, LedgerEntry, inbox/outbox")
-  Container(geo, "Geofence Service", "REST API + geo workers", "Geofencing")
-  ContainerDb(geodb, "Geofence DB", "PostgreSQL / PostGIS", "Geofence, версии, GeoCheck, ViolationEvidence, inbox/outbox")
+  Boundary(user_svc, "User Service", $type="service") {
+    Container(user_api, "User API", "Kotlin, Spring Boot", "OTP-вход, токены, профиль, право старта")
+    Container(user_worker, "User Worker", "Kotlin, Spring Kafka", "Статус доступа, удаление ПДн")
+    ContainerDb(user_db, "User DB", "PostgreSQL", "user_account, user_pii, user_session, otp_challenge, user_access, user_block, user_consent, user_financial_state, account_deletion_request; auth_audit_event — помесячные партиции (12 мес.); ≈ 40 ГБ (оценка) — без шардирования")
+  }
+  Boundary(fleet_svc, "Fleet Service", $type="service") {
+    Container(fleet_api, "Fleet API", "Kotlin, Spring Boot", "Состояние, lease, приём команд, повреждения")
+    Container(fleet_cmd_worker, "Fleet Command Worker", "Kotlin, MQTT client", "Команды, результаты, тайм-ауты")
+    Container(fleet_event_worker, "Fleet Event Worker", "Kotlin, Spring Kafka", "Проекция телеметрии, фото повреждений")
+    ContainerDb(fleet_db, "Fleet DB", "PostgreSQL", "scooter (lease_epoch), scooter_active_lease, scooter_last_measurement, device_command_queue (очередь), damage_report; scooter_lease и device_command (история) — помесячные партиции; shard key cityId")
+  }
+  Boundary(telemetry_svc, "Telemetry Service", $type="service") {
+    Container(telemetry_ingestor, "Telemetry Ingestor", "Kotlin, MQTT client", "Дедуп, пакетная запись, подпись")
+    Container(telemetry_api, "Telemetry API", "Kotlin, Spring Boot", "Последнее, история, snapshot")
+    ContainerDb(telemetry_db, "Telemetry DB", "PostgreSQL + TimescaleDB", "hypertable telemetry_measurement, сжатие ~10×, сырые 30 дн.; telemetry_minute (минутные агрегаты, 1 год); scooter_last_location (UNLOGGED); shard key scooterId; без outbox")
+  }
+  Boundary(discovery_svc, "Discovery Service", $type="service") {
+    Container(discovery_projector, "Discovery Projector", "Kotlin, Spring Kafka", "Геоиндекс из событий и snapshot")
+    Container(discovery_api, "Discovery API", "Kotlin, Spring WebFlux", "Поиск рядом, карточка, карта зон")
+    ContainerDb(discovery_index, "Discovery Index", "Redis Cluster", "GEO-индекс доступных самокатов, карточки, checkpoints; hash tag {cityId}; восстановим из snapshot + событий")
+  }
+  Boundary(trip_svc, "Trip Service", $type="service") {
+    Container(trip_api, "Trip API", "Kotlin, Spring Boot", "Команды старта/завершения, чтение поездок")
+    Container(trip_worker, "Trip Saga Worker", "Kotlin, Spring Boot", "Шаги saga, компенсации, TripEnded")
+    ContainerDb(trip_db, "Trip DB", "PostgreSQL, primary + read replica", "trip, trip_transition, trip_operation, trip_parking_photo — помесячные партиции по UUIDv7, горячие 13 мес.; saga_step — 2 мес.; user_active_trip, trip_review без партиций; shard key userId")
+  }
+  Boundary(pricing_svc, "Pricing Service", $type="service") {
+    Container(pricing_api, "Pricing API", "Kotlin, Spring Boot", "Тарифы, котировки, расчёт цены")
+    ContainerDb(pricing_db, "Pricing DB", "PostgreSQL", "tariff, tariff_version (неизменяемые); quote — суточные партиции (7 дн.); price_calculation — помесячные (13 мес.), далее архив; малый объём — без шардирования")
+  }
+  Boundary(billing_svc, "Billing Service", $type="service") {
+    Container(billing_api, "Billing API", "Kotlin, Spring Boot", "Способы оплаты, авторизации, штрафы, webhook")
+    Container(billing_settlement, "Billing Settlement Worker", "Kotlin, Spring Kafka", "Расчёт и списание, долги, штрафы")
+    Container(billing_recon, "Billing Reconciliation Worker", "Kotlin, Spring Boot", "Webhook-inbox, сверка с PSP")
+    ContainerDb(billing_db, "Billing DB", "PostgreSQL", "payment_authorization, payment, payment_operation, trip_settlement, ledger_transaction, ledger_entry, psp_registry_line — помесячные партиции, в БД 18 мес., далее архив (≥ 5 лет); psp_webhook_inbox — без партиций, 14 сут после обработки; fine, fine_appeal, payment_method; shard key userId")
+  }
+  Boundary(geo_svc, "Geofence Service", $type="service") {
+    Container(geo_api, "Geofence API", "Kotlin, Spring Boot, JTS", "Проверки старта/парковки, версии зон")
+    ContainerDb(geo_db, "Geofence DB", "PostgreSQL + PostGIS", "geofence_version, geofence_zone (GiST); geo_check, violation_evidence — помесячные партиции; без шардирования")
+  }
+  Boundary(photo_svc, "Photo Service", $type="service") {
+    Container(photo_api, "Photo API", "Kotlin, Spring Boot", "Сессии загрузки, presigned URL, удержания")
+    Container(photo_worker, "Photo Processing Worker", "Kotlin, Spring Boot", "Проверка, превью, дедуп, ретенция")
+    ContainerDb(photo_db, "Photo DB", "PostgreSQL", "photo — помесячные партиции, photo_retention_hold, photo_phash, photo_processing_job; не шардируется (по триггеру — ownerUserId, бакет в последнем байте photoId)")
+    ContainerDb(s3, "Photo Object Storage", "S3-совместимое объектное хранилище", "scooter-photos-originals (SSE-KMS, Object Lock), scooter-photos-derivatives")
+  }
+
+  ContainerDb(archive, "Archive Store (платформенное архивное хранилище)", "S3-совместимое, регион РФ; SSE, versioning + Object Lock на срок хранения", "Parquet + манифест SHA-256: trip-archive/ (Trip, старше 13 мес., 5 лет), Billing Archive (compliance, 5 лет после отчётного года; сырые webhook, реестры PSP); также архивы Fleet, Pricing, Geofence (data-storage §6.4)")
+
+  Container(cdc, "Outbox CDC", "Kafka Connect + Debezium Outbox Event Router", "Читает outbox_event из WAL, публикует в топик из поля topic")
+  ContainerQueue(kafka, "Доменные события", "Apache Kafka + Schema Registry", "10 топиков — см. c4-events")
 }
 
-Rel_R(user, userdb, "Владеет; читает/пишет", "SQL")
-Rel_R(fleet, fleetdb, "Владеет; читает/пишет", "SQL")
-Rel_R(telemetry, telemetrydb, "Владеет; читает/пишет", "SQL")
-Rel_R(discovery, searchdb, "Обновляет/читает проекцию", "Redis")
-Rel_R(trip, tripdb, "Владеет; читает/пишет", "SQL")
-Rel_R(pricing, pricingdb, "Владеет; читает/пишет", "SQL")
-Rel_R(billing, billingdb, "Владеет; читает/пишет", "SQL")
-Rel_R(geo, geodb, "Владеет; читает/пишет", "SQL")
+' --- Контейнеры -> собственные хранилища
+Rel(user_api, user_db, "аккаунты, сессии, OTP; outbox", "SQL")
+Rel(user_worker, user_db, "статус доступа, удаление ПДн; inbox/outbox", "SQL")
+Rel(fleet_api, fleet_db, "lease, приём команд, повреждения; outbox", "SQL")
+Rel(fleet_cmd_worker, fleet_db, "очередь команд (SKIP LOCKED), результаты; outbox", "SQL")
+Rel(fleet_event_worker, fleet_db, "последнее подписанное измерение, статус фото; inbox", "SQL")
+Rel(telemetry_ingestor, telemetry_db, "пакетная запись измерений", "SQL (INSERT … SELECT FROM unnest … ON CONFLICT)")
+Rel(telemetry_api, telemetry_db, "последнее, история, snapshot", "SQL", $tags="ro")
+Rel(discovery_projector, discovery_index, "обновляет проекцию, checkpoints", "Redis")
+Rel(discovery_api, discovery_index, "GEOSEARCH, карточки", "Redis", $tags="ro")
+Rel(trip_api, trip_db, "команды — primary; история — read replica", "SQL")
+Rel(trip_worker, trip_db, "saga_step (SKIP LOCKED), trip; inbox/outbox", "SQL")
+Rel(pricing_api, pricing_db, "тарифы, котировки; outbox", "SQL")
+Rel(billing_api, billing_db, "авторизации, штрафы, webhook; outbox", "SQL")
+Rel(billing_settlement, billing_db, "списания, проводки, долги; inbox/outbox", "SQL")
+Rel(billing_recon, billing_db, "исходы платежей, сверка; outbox", "SQL")
+Rel(geo_api, geo_db, "версии зон, проверки, свидетельства; outbox", "SQL")
+Rel(photo_api, photo_db, "сессии, метаданные, удержания", "SQL")
+Rel(photo_worker, photo_db, "статусы, pHash, ретенция; inbox/outbox", "SQL")
+Rel(photo_api, s3, "HEAD объекта; presign", "S3 API")
+Rel(photo_worker, s3, "оригинал → превью; удаление", "S3 API")
+Rel(trip_worker, archive, "Parquet-выгрузка партиций старше 13 мес. (Scheduler)", "S3 API")
+Rel(billing_recon, archive, "Parquet-архив партиций, сырые webhook (PartitionArchiver)", "S3 API")
 
-Lay_D(user, fleet)
-Lay_D(fleet, telemetry)
-Lay_D(telemetry, discovery)
-Lay_D(discovery, trip)
-Lay_D(trip, pricing)
-Lay_D(pricing, billing)
-Lay_D(billing, geo)
+' --- Outbox CDC: WAL -> Kafka
+Rel_U(cdc, user_db, "читает outbox_event", "WAL", $tags="cdc")
+Rel_U(cdc, fleet_db, "читает outbox_event", "WAL", $tags="cdc")
+Rel_U(cdc, trip_db, "читает outbox_event", "WAL", $tags="cdc")
+Rel_U(cdc, pricing_db, "читает outbox_event", "WAL", $tags="cdc")
+Rel_U(cdc, billing_db, "читает outbox_event", "WAL", $tags="cdc")
+Rel_U(cdc, geo_db, "читает outbox_event", "WAL", $tags="cdc")
+Rel_U(cdc, photo_db, "читает outbox_event", "WAL", $tags="cdc")
+Rel(cdc, kafka, "публикует события", "Kafka")
+
+note as N1
+  **Telemetry DB без outbox:**
+  LocationObserved публикует
+  Ingestor напрямую (c4-events).
+  **HA:** Trip, Fleet, Billing —
+  синхронная реплика (др. AZ)
+  + async read replica.
+  pg-core (User, Pricing, Geofence,
+  Photo) — асинхронная по умолчанию;
+  кворумная синхронная реплика
+  настроена (synchronous_commit =
+  local по умолчанию), критичные
+  транзакции — SET LOCAL
+  synchronous_commit = on: User —
+  блокировки, удаление, ключи;
+  Pricing — изменения тарифов;
+  Geofence — свидетельства (опц.).
+  Telemetry — async реплика.
+  PgBouncer перед каждой БД;
+  PostgreSQL 17+ на всех БД
+  (failover-слоты для Debezium).
+  **PITR** (WAL-архив): Billing —
+  35 сут; Trip, Fleet, Pricing,
+  Photo, Geofence, User — 14 сут;
+  Telemetry — 7 сут.
+  **Шардирование** на старте
+  выключено: 256 бакетов
+  hash(shard key) mod 256;
+  перенос бакета — logical
+  replication.
+end note
 
 SHOW_LEGEND()
 @enduml

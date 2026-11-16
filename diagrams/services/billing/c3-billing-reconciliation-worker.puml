@@ -1,0 +1,51 @@
+@startuml c3-billing-reconciliation-worker
+!pragma layout smetana
+!include <C4/C4_Component>
+title C4 — C3: Billing Reconciliation Worker (Billing Service)
+LAYOUT_TOP_DOWN()
+
+ContainerDb(billing_db, "Billing DB", "PostgreSQL 17 (через PgBouncer)", "psp_webhook_inbox, payment_operation, payment_authorization, payment, ledger, psp_registry_line, outbox")
+System_Ext(psp, "Платёжный провайдер (PSP)", "API статуса операций, void, реестры (SFTP / HTTPS)")
+ContainerDb(billing_archive, "Billing Archive (бакет Archive Store)", "S3-совместимое (платформа), versioning + Object Lock (compliance)", "Parquet-архив, сырые webhook и реестры")
+Container(trip_api, "Trip API", "Kotlin, Spring Boot", "GET /internal/v1/trips/{tripId}: статус поездки, authorizationId")
+
+Container_Boundary(recon, "Billing Reconciliation Worker") {
+  Component(inbox_poller, "WebhookInboxPoller", "Kotlin, @Scheduled", "psp_webhook_inbox status=RECEIVED: FOR UPDATE SKIP LOCKED, батч 100")
+  Component(translator, "PspEventTranslator (ACL)", "Kotlin", "Событие PSP → исход внутренней операции; поиск по merchant reference")
+  Component(applier, "OperationOutcomeApplier", "Kotlin, domain", "Условный переход операции, авторизации, платежа, способа оплаты; монотонный автомат")
+  Component(unknown, "UnknownOutcomeReconciler", "Kotlin, @Scheduled", "PENDING_RECONCILIATION, UNKNOWN, зависшие REQUESTED → запрос статуса у PSP")
+  Component(janitor, "HoldJanitor", "Kotlin, @Scheduled", "Поздние hold (CANCEL_PENDING) → VOID; осиротевший hold (AUTHORIZED, нет trip_settlement) → решение по статусу поездки, не по возрасту")
+  Component(loader, "RegistryLoader", "Kotlin, SFTP/HTTPS", "Ежедневный реестр PSP → psp_registry_line")
+  Component(registry, "RegistryReconciler", "Kotlin, @Scheduled, ShedLock", "Реестр ↔ payment_operation ↔ ledger; проводки клиринга и комиссий; расхождения")
+  Component(archiver, "PartitionArchiver", "Kotlin, @Scheduled, ShedLock", "Создание партиций вперёд; выгрузка в Parquet, DETACH / DROP")
+  Component(psp_client, "PSP Client (ACL)", "Kotlin, Resilience4j", "Пул recon: низший приоритет, rate limiter, CB, тайм-аут 5 с")
+  Component(trip_client, "Trip API Client", "WebClient, Resilience4j", "Тайм-аут 300 мс, 2 повтора, CB; 503 / открытый CB → проверка откладывается")
+  Component(ledger, "Ledger & Outbox Writer", "Kotlin, JDBC", "Проводки + PaymentStatusChanged; FineStatusChanged(PAID) по исходу CHARGE штрафа — в outbox")
+  Component(repos, "Repositories", "Spring JDBC", "Доступ к таблицам Billing DB")
+  Component(metrics, "Recon Metrics", "Micrometer", "Возраст неизвестных исходов, backlog inbox, расхождения")
+}
+
+Rel(inbox_poller, translator, "Сырое событие")
+Rel(translator, applier, "Исход операции")
+Rel(translator, psp_client, "Неизвестная ссылка → статус")
+Rel(unknown, psp_client, "GET статуса по ключу идемпотентности")
+Rel(unknown, applier, "Установленный исход")
+Rel(janitor, psp_client, "void, удаление токена")
+Rel(janitor, applier, "CANCELLED")
+Rel(janitor, trip_client, "Статус поездки осиротевшего hold")
+Rel(trip_client, trip_api, "GET /internal/v1/trips/{tripId}", "HTTPS/JSON, mTLS")
+Rel(loader, psp_client, "Скачать реестр")
+Rel(loader, registry, "Реестр загружен")
+Rel(psp_client, psp, "Статус, void, реестры", "HTTPS/JSON, SFTP")
+Rel(applier, ledger, "Проводки и события")
+Rel(registry, ledger, "Клиринг, комиссии")
+Rel(ledger, repos, "INSERT в транзакции")
+Rel(inbox_poller, repos, "Выбор батча")
+Rel(registry, metrics, "Расхождения")
+Rel(repos, billing_db, "Чтение/запись", "SQL")
+Rel(archiver, billing_db, "CREATE / DETACH PARTITION, COPY", "SQL")
+Rel(archiver, billing_archive, "Parquet + манифест SHA-256", "S3 API")
+Rel(loader, billing_archive, "Исходный файл реестра", "S3 API")
+
+SHOW_LEGEND()
+@enduml

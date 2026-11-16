@@ -1,94 +1,167 @@
 @startuml trip-start-sequence
-title Запуск поездки — durable saga, исключительный lease и реальный ACK
+!pragma layout smetana
+title Запуск поездки — durable saga по контейнерам: исключительный lease, авторизация, реальный ACK
 hide footbox
 skinparam shadowing false
 skinparam defaultFontName SansSerif
-skinparam defaultFontSize 13
+skinparam defaultFontSize 12
+skinparam maxMessageSize 260
+skinparam BoxPadding 6
 autonumber
 
-actor "Клиент" as client
-participant "Trip Service" as trip
-database "Trip DB" as db
-participant "User Service" as user
-participant "Pricing Service" as pricing
-participant "Geofence Service" as geo
-participant "Fleet Service" as fleet
-participant "Billing Service" as billing
+actor "Пользователь /\nприложение" as client
+participant "API Gateway" as gw
+box "Trip Service" #EEF4FB
+  participant "Trip API" as tapi
+  database "Trip DB" as tdb
+  participant "Trip Saga\nWorker" as tw
+end box
+participant "User API" as user
+participant "Geofence API" as geo
+participant "Pricing API" as pricing
+box "Fleet Service" #F2F8EE
+  participant "Fleet API" as fleet
+  participant "Fleet Command\nWorker" as fcw
+end box
+queue "MQTT Broker" as mqtt
+participant "Бортовая\nсистема" as device
+queue "Kafka" as kafka
+participant "Billing API" as billing
 participant "PSP" as psp
-queue "MQTT" as mqtt
-participant "Самокат" as device
 
-client -> trip : POST /trips {scooterId}\nIdempotency-Key
-trip -> db : Создать PREPARING и шаги saga\nУникальность незавершённой поездки userId
-db --> trip : tripId, operationId
-trip --> client : 202 Accepted + tripId/operationId
-note over trip,db
-  Состояние saga и намерение следующего шага сохраняются.
-  После перезапуска worker продолжает с сохранённого шага.
-  Повтор запроса возвращает существующую операцию.
+== Приём команды: только локальная транзакция, без синхронных вызовов сервисов ==
+client -> gw : POST /api/v1/trips {scooterId}\nIdempotency-Key, Authorization: Bearer
+gw -> tapi : проксирует (JWT проверен)
+tapi -> tdb : BEGIN; idempotency_record; trip PREPARING;\nuser_active_trip (PK user_id); trip_operation START;\nsaga_step CHECK_ELIGIBILITY; trip_transition; COMMIT
+alt у пользователя уже есть незавершённая поездка
+  tdb --> tapi : unique violation user_active_trip
+  tapi --> client : 409 ACTIVE_TRIP_EXISTS {activeTripId}
+else принято
+  tdb --> tapi : commit
+  tapi --> client : 202 {tripId, operationId, status: PREPARING}
+end
+note over tapi,tw
+  Повтор с тем же Idempotency-Key возвращает сохранённый 202.
+  Состояние saga — строки saga_step; после рестарта worker
+  продолжает с сохранённого шага (FOR UPDATE SKIP LOCKED).
 end note
-trip -> user : Проверить rental-eligibility
-user --> trip : allowed + версия
-trip -> fleet : Получить состояние и доверенное измерение
-fleet --> trip : Готовность, координата, время, точность
-trip -> geo : Проверить старт по измерению
-geo --> trip : allowed + policyVersion/checkId
-trip -> pricing : Создать котировку
-pricing --> trip : Неизменяемый snapshot + expiresAt
-trip -> fleet : Захватить lease(scooterId, tripId)
-fleet --> trip : leaseId + fencingToken (атомарно)
-trip -> billing : Авторизовать сумму\noperationKey = tripId:authorize
-billing -> psp : Авторизация с idempotency key
 
-alt Явный отказ авторизации
+== Проверки (каждый шаг: вызов → COMMIT результата и следующего saga_step) ==
+tw -> tdb : захват готового шага (SKIP LOCKED)
+tw -> user : GET /internal/v1/users/{userId}/rental-eligibility
+alt User недоступен (503 / тайм-аут 500 мс после 1 повтора / CB открыт)
+  tw -> tdb : fail-closed: CANCELLED (DEPENDENCY_UNAVAILABLE);\nудалить user_active_trip (компенсаций нет)
+else ответ получен
+  user --> tw : {eligible: true, reasons: [], accessVersion}
+  tw -> tdb : trip.access_version = accessVersion\n(решение только по eligible; reasons — как есть)
+end
+tw -> fleet : GET /internal/v1/scooters/{scooterId}
+fleet --> tw : availability, online, подписанное measurement
+tw -> geo : POST /internal/v1/geo-checks/start {measurement}
+geo --> tw : {checkId, allowed: true, reasonCode, policyVersion}
+tw -> pricing : POST /internal/v1/quotes\nIdempotency-Key: {tripId}:quote; requestedAt = время сервера Trip
+pricing --> tw : {quoteId, snapshot, snapshotHash, signature (JWS),\nauthorizationAmountMinor, expiresAt}
+tw -> pricing : GET /internal/v1/signing-keys\n(только при промахе кеша JWKS 5 мин или неизвестном kid)
+note right of tw
+  SHA-256(JCS(snapshot)) = snapshotHash и JWS EdDSA верна.
+  Подпись неверна → одна повторная котировка ({tripId}:quote:2),
+  затем CANCELLED (QUOTE_UNAVAILABLE).
+end note
+tw -> fleet : POST /internal/v1/scooters/{id}/leases\nIdempotency-Key: {tripId}:lease\n{tripId, userId, ttlSeconds: 90}
+fleet --> tw : 201 {leaseId, fencingToken, phase: PREPARING}
+tw -> tdb : сохранить lease, quote; saga_step AUTHORIZE_PAYMENT
+note right of tw
+  Отказ любой проверки → CANCELLED + компенсации
+  (release lease, если он уже создан); user_active_trip удаляется.
+end note
+
+== Авторизация средств ==
+tw -> billing : POST /internal/v1/payment-authorizations (тайм-аут 4 с)\n{operationKey: "{tripId}:authorize", amount}
+billing -> psp : авторизация (idempotency key; тайм-аут PSP 3 с)
+
+alt явный отказ
   psp --> billing : declined
-  billing --> trip : DECLINED
-  trip -> fleet : Освободить подготовительный lease\nТолько тот же tripId, команда не отправлялась
-  trip -> db : CANCELLED + причина
-else Результат авторизации неизвестен
-  psp --> billing : Timeout / потерянный ответ
-  billing --> trip : PENDING_RECONCILIATION
-  trip -> db : Ожидание сверки; UNLOCK не отправлять
-  billing -> psp : Сверить по merchant reference
-  note over trip,psp
-    Продолжить только после подтверждённой авторизации
-    и повторной проверки lease/котировки.
-    При отмене старта поздний hold снимается идемпотентно.
+  billing --> tw : 201 {status: DECLINED, declineCode}
+  tw -> fleet : POST /internal/v1/leases/{leaseId}/release\nIdempotency-Key: {tripId}:release\n{tripId, fencingToken, reason: TRIP_CANCELLED}
+  fleet --> tw : {phase: RELEASED}
+  tw -> tdb : CANCELLED (PAYMENT_DECLINED);\nудалить user_active_trip
+else исход неизвестен (тайм-аут PSP или тайм-аут Trip 4 с)
+  psp --> billing : тайм-аут / потерянный ответ
+  billing --> tw : 201 {status: PENDING_RECONCILIATION}
+  tw -> tdb : saga_step AWAIT_AUTHORIZATION (WAITING);\nUNLOCK не отправлять
+  billing -> psp : сверка по merchant reference
+  loop опрос с backoff 1, 2, 4, 8, 16, 30 с; дедлайн 2 мин
+    tw -> billing : GET /internal/v1/payment-authorizations/{id}
+    billing --> tw : AUTHORIZED | DECLINED | PENDING_RECONCILIATION
+  end
+  note over tw,psp
+    Событие об исходе PENDING_RECONCILIATION Billing не публикует:
+    Trip узнаёт исход только опросом GET (тайм-аут 300 мс, backoff 1 → 30 с).
+    AUTHORIZED → повторная проверка lease/котировки и переход к UNLOCK.
+    Дедлайн истёк → POST .../{id}/cancel {reason: START_TIMEOUT}
+    (CANCEL_PENDING допустим),
+    release lease, CANCELLED; поздний hold Billing снимет сам.
   end note
-else Авторизация подтверждена
-  psp --> billing : authorized + authorizationId
-  billing --> trip : AUTHORIZED
-  trip -> db : Проверить срок котировки; сохранить\nSTARTING + snapshot + намерение UNLOCK
-  trip -> fleet : UNLOCK(commandId, tripId, lease, expiresAt)
-  note right of fleet
-    Lease, владелец и token проверяются атомарно.
-    DeviceCommand + outbox фиксируются локально.
-    После потенциальной отправки TTL lease
-    не делает самокат свободным автоматически.
+else авторизовано
+  psp --> billing : authorized
+  billing --> tw : 201 {authorizationId, status: AUTHORIZED}
+  tw -> tdb : проверить lease.expiresAt > now() + 20 с и quote.expiresAt\n(истекла → одна повторная котировка, ключ {tripId}:quote:2);\nSTARTING + snapshot + saga_step SEND_UNLOCK(commandId)
+  note right of tw
+    commandId — UUIDv7, создаётся вместе с шагом;
+    последний байт = последнему байту leaseId (бакет cityId,
+    общая хеш-функция); Fleet проверяет равенство
+    (иначе 400 VALIDATION_FAILED),
+    поэтому Fleet находит команду без fan-out.
   end note
-  fleet --> trip : Команда принята, но ещё не исполнена
-  fleet -> mqtt : UNLOCK с ID, сроком и fencing token
-  mqtt -> device : Доставить UNLOCK
 
-  alt Получено подтверждение фактического открытия
-    device -> mqtt : CommandResult(commandId, OPEN, deviceTime)
-    mqtt -> fleet : Передать результат устройства
-    trip -> fleet : Получить результат (polling / событие Kafka)
-    fleet --> trip : OPEN_CONFIRMED + проверенное время
-    trip -> db : ACTIVE + startedAt + outbox
-  else Потеря ACK / неизвестный результат
-    trip -> db : RECONCILING; ресурс и пользователь заняты
-    trip -> fleet : Запросить сверку замка и команды
-    fleet -> mqtt : QUERY_STATE
-    mqtt -> device : Проверить фактическое состояние
-    note over trip,device
-      Подтверждённое исполнение -> ACTIVE.
-      Подтверждённое неисполнение -> отмена и снятие hold.
-      Пока результат неизвестен, новый lease запрещён.
+  == Разблокировка и подтверждение устройства ==
+  tw -> fleet : POST /internal/v1/leases/{leaseId}/commands\n{commandId, type: UNLOCK, fencingToken, expiresAt: +15 с}
+  note right of fleet
+    Lease, tripId и fencing token проверяются атомарно;
+    DeviceCommand + outbox — одна транзакция Fleet DB.
+    После отправки команды TTL lease не освобождает самокат.
+  end note
+  fleet --> tw : 202 {commandId, status: ACCEPTED}
+  tw -> tdb : saga_step AWAIT_UNLOCK (WAITING, fallback-опрос через 3 с)
+  fleet -> fcw : команда в очереди Fleet DB
+  fcw -> mqtt : PUBLISH devices/{id}/commands QoS 1\n{commandId, UNLOCK, fencingToken, expiresAt}
+  mqtt -> device : UNLOCK
+
+  alt подтверждено фактическое открытие
+    device -> mqtt : devices/{id}/command-results\n{commandId, lockState: OPEN, deviceTime}
+    mqtt -> fcw : результат
+    fcw -> kafka : DeviceCommandUpdated EXECUTED\n(outbox → Outbox CDC)
+    kafka -> tw : fleet.device-command.v1
+    opt событие задержано > 3 с
+      tw -> fleet : GET /internal/v1/commands/{commandId}?leaseId={leaseId}
+      fleet --> tw : EXECUTED, result.lockState = OPEN
+    end
+    tw -> tdb : ACTIVE, startedAt = deviceTime\n(расхождение часов ≤ 5 с, иначе serverReceivedAt)
+  else явный отказ устройства (FAILED / EXPIRED без исполнения)
+    kafka -> tw : DeviceCommandUpdated FAILED
+    tw -> fleet : POST .../leases/{leaseId}/release\n{tripId, fencingToken, reason: TRIP_CANCELLED}
+    tw -> billing : POST .../payment-authorizations/{id}/cancel\nIdempotency-Key: {tripId}:cancel\n{reason: UNLOCK_NOT_EXECUTED}
+    tw -> tdb : CANCELLED (UNLOCK_FAILED); удалить user_active_trip
+  else ACK потерян / UNKNOWN / тайм-аут ожидания (expiresAt + 5 с)
+    tw -> tdb : RECONCILING; user_active_trip и lease сохраняются
+    tw -> fleet : POST .../commands {type: QUERY_STATE}
+    fleet -> fcw : QUERY_STATE
+    fcw -> mqtt : devices/{id}/commands
+    mqtt -> device : QUERY_STATE
+    device -> mqtt : devices/{id}/state {lockState, lastCommandId}
+    mqtt -> fcw : состояние
+    fcw -> kafka : DeviceCommandUpdated (QUERY_STATE)
+    kafka -> tw : результат сверки
+    note over tw,device
+      OPEN и lastCommandId = UNLOCK → ACTIVE.
+      CLOSED и команда не исполнялась → cancel hold, release, CANCELLED.
+      Нет ответа 10 мин → trip_review, решение оператора;
+      до решения самокат и пользователь заняты, hold не снимается вслепую.
     end note
   end
 end
 
-client -> trip : GET /trips/{tripId}
-trip --> client : Текущее состояние и причина ожидания/отказа
+client -> gw : GET /api/v1/trips/{tripId}/operations/{operationId}
+gw -> tapi : проксирует
+tapi --> client : {status, step, failure|null}; ETag (304 без изменений)
 @enduml

@@ -1,0 +1,54 @@
+@startuml c2-photo
+!pragma layout smetana
+!include <C4/C4_Container>
+title C4 — C2: Photo Service — контейнеры
+LAYOUT_TOP_DOWN()
+
+Person(rider, "Пользователь", "Фотографирует парковку, повреждения, доказательства для обжалования")
+Person(operator, "Оператор", "Разбирает спорные фото, ставит удержания")
+
+System_Boundary(platform, "Платформа аренды самокатов") {
+  Container(app, "Мобильное приложение", "iOS / Android", "Камера, SHA-256 файла, загрузка по presigned URL")
+  Container(gateway, "API Gateway", "HTTPS reverse proxy", "Проверка JWT, квоты, маршрут /api/v1/photos/~*~*")
+  Container(user_api, "User API", "Kotlin, Spring Boot", "JWKS")
+
+  Boundary(photo_svc, "Photo Service", $type="service") {
+    Container(photo_api, "Photo API", "Kotlin, Spring Boot", "Сессии загрузки, presigned URL, метаданные, ссылки просмотра, удержания")
+    Container(photo_worker, "Photo Processing Worker", "Kotlin, Spring Boot", "Проверка, превью, дедуп/pHash, публикация статуса, ретенция, удаление, сверка с S3")
+    ContainerDb(photo_db, "Photo DB", "PostgreSQL", "photo, photo_processing_job, photo_retention_hold, photo_phash, photo_access_audit, outbox/inbox")
+    ContainerDb(photo_s3, "Photo Object Storage", "S3-совместимое объектное хранилище, регион РФ", "scooter-photos-originals (SSE-KMS, Object Lock), scooter-photos-derivatives")
+  }
+
+  Container(trip_worker, "Trip Saga Worker", "Kotlin, Spring Boot", "Привязывает фото к завершению поездки")
+  Container(fleet_api, "Fleet API", "Kotlin, Spring Boot", "Отчёты о повреждениях")
+  Container(fleet_event_worker, "Fleet Event Worker", "Kotlin, Spring Kafka", "Статусы фото повреждений")
+  Container(billing_api, "Billing API", "Kotlin, Spring Boot", "Обжалования штрафов")
+  Container(outbox_cdc, "Outbox CDC", "Kafka Connect + Debezium", "Читает WAL outbox_event, публикует в Kafka")
+  ContainerQueue(kafka, "Доменные события", "Apache Kafka + Schema Registry", "At least once, партиции по ключу агрегата")
+}
+
+Rel(rider, app, "Снимает и отправляет фото")
+Rel(app, gateway, "upload-sessions, complete, статус, view-url", "HTTPS/JSON, JWT")
+Rel(app, photo_s3, "Оригинал: presigned PUT; превью: presigned GET", "HTTPS, S3 presigned URL")
+Rel(operator, gateway, "Поиск, просмотр с причиной, удержания", "HTTPS/JSON, JWT")
+Rel(gateway, photo_api, "/api/v1/photos/~*~*, /admin/v1/photos/~*~*", "HTTPS/JSON")
+
+Rel(photo_api, user_api, "JWKS (кеш)", "HTTPS")
+Rel(photo_api, photo_db, "Строка фото до выдачи URL, статусы, задания, удержания, аудит", "SQL, PgBouncer")
+Rel(photo_api, photo_s3, "HEAD при complete (URL подписываются локально)", "S3 API")
+
+Rel(trip_worker, photo_api, "GET /internal/v1/photos/{id}: RECONCILE_PHOTO после завершения", "HTTPS/JSON, mTLS")
+Rel(fleet_api, photo_api, "Проверка фото отчёта о повреждении", "HTTPS/JSON, mTLS")
+Rel(billing_api, photo_api, "Проверка фото обжалования", "HTTPS/JSON, mTLS")
+
+Rel(photo_worker, photo_db, "Очередь (FOR UPDATE SKIP LOCKED), статусы, outbox, inbox, удержания", "SQL, PgBouncer")
+Rel(photo_worker, photo_s3, "GET оригинала, PUT превью, DELETE версий, legal hold, Inventory", "S3 API")
+
+Rel(outbox_cdc, photo_db, "Читает outbox_event из WAL", "logical replication")
+Rel(outbox_cdc, kafka, "PhotoValidated, PhotoRejected", "Kafka: photo.status.v1")
+Rel(kafka, photo_worker, "UserAccessChanged, FineIssued, FineStatusChanged", "Kafka: user.access.v1, billing.fine.v1")
+Rel(kafka, trip_worker, "Статус фото парковки", "Kafka: photo.status.v1")
+Rel(kafka, fleet_event_worker, "Статус фото повреждений", "Kafka: photo.status.v1")
+
+SHOW_LEGEND()
+@enduml
